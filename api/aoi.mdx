@@ -1,0 +1,246 @@
+---
+title: "Areas of Interest API: Spatial Monitoring Zones"
+sidebarTitle: "AOI"
+description: "CRUD API for Areas of Interest (AOIs): polygon zones that scope incident queries with PostGIS ST_Intersects filtering and per-category severity thresholds."
+---
+
+Areas of Interest (AOIs) are named polygon zones that define the geographic scope of your monitoring operations. Each AOI stores a GeoJSON `Polygon` or `MultiPolygon` geometry that tells GeoSentinel which incidents are spatially relevant to you. When you query incidents through an AOI, the platform runs PostGIS `ST_Intersects` against every active incident's `canonical_point`, returning only those that fall within your defined boundary. AOIs also carry optional per-zone configuration: a list of `categories` to restrict which event types are surfaced, and a `min_severity` threshold so low-signal noise is automatically filtered before results reach you.
+
+---
+
+## `POST /v1/aoi` — Create AOI
+
+Creates a new Area of Interest. The geometry is stored in PostGIS using SRID 4326 and a GiST spatial index is automatically applied.
+
+### Request Body
+
+<ParamField body="name" type="string" required>
+  A human-readable label for this AOI. Must be non-empty.
+</ParamField>
+
+<ParamField body="description" type="string">
+  Optional free-text description of the zone's purpose or coverage.
+</ParamField>
+
+<ParamField body="geometry" type="object" required>
+  A GeoJSON geometry object defining the AOI boundary. Must be either a `Polygon` or `MultiPolygon`. The `type` field is required, and `coordinates` must follow the standard GeoJSON ring format (first and last coordinate identical for closure).
+</ParamField>
+
+<ParamField body="categories" type="array of strings">
+  Restrict this AOI to specific event categories (e.g. `["conflict", "wildfire"]`). When `null` or omitted, all categories are included.
+</ParamField>
+
+<ParamField body="min_severity" type="float" default="0.0">
+  Minimum severity score for incidents to be surfaced within this AOI. Must be in the range `[0.0, 10.0]`. Incidents below this threshold are excluded from `/incidents` queries against this AOI.
+</ParamField>
+
+### Response — `201 Created`
+
+Returns an `AoiResponse` object for the newly created AOI.
+
+```bash
+curl -X POST http://localhost:8000/v1/aoi \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Iberian Peninsula",
+    "description": "Monitor Spain and Portugal",
+    "geometry": {
+      "type": "Polygon",
+      "coordinates": [[[-9.5, 35.9], [4.3, 35.9], [4.3, 43.8], [-9.5, 43.8], [-9.5, 35.9]]]
+    },
+    "categories": ["conflict", "wildfire"],
+    "min_severity": 3.0
+  }'
+```
+
+---
+
+## `GET /v1/aoi` — List AOIs
+
+Returns a paginated list of all **active** AOIs (`is_active = true`). Deactivated (soft-deleted) AOIs are never included in this response.
+
+### Query Parameters
+
+<ParamField query="page" type="integer" default="1">
+  Page number to retrieve. Must be ≥ 1.
+</ParamField>
+
+<ParamField query="limit" type="integer" default="50">
+  Number of AOIs per page. Maximum value is `100`.
+</ParamField>
+
+### Response — `200 OK`
+
+Returns an `AoiListResponse` with a `total` count and an `aois` array.
+
+```bash
+curl "http://localhost:8000/v1/aoi?page=1&limit=20"
+```
+
+---
+
+## `GET /v1/aoi/{aoi_id}` — Get AOI
+
+Retrieves a single AOI by its UUID. The geometry is returned as a GeoJSON object deserialized from PostGIS WKB.
+
+### Path Parameters
+
+<ParamField path="aoi_id" type="string (UUID)" required>
+  The unique identifier of the AOI to retrieve.
+</ParamField>
+
+### Response — `200 OK`
+
+Returns an `AoiResponse` object. Returns `404` if no AOI with the given `aoi_id` exists.
+
+```bash
+curl "http://localhost:8000/v1/aoi/550e8400-e29b-41d4-a716-446655440000"
+```
+
+---
+
+## `PUT /v1/aoi/{aoi_id}` — Update AOI
+
+Updates one or more fields of an existing AOI. All body fields are optional — only the fields you include will be modified. Omitted fields retain their current values.
+
+### Path Parameters
+
+<ParamField path="aoi_id" type="string (UUID)" required>
+  The unique identifier of the AOI to update.
+</ParamField>
+
+### Request Body
+
+<ParamField body="name" type="string">
+  New label for the AOI.
+</ParamField>
+
+<ParamField body="description" type="string">
+  Updated free-text description.
+</ParamField>
+
+<ParamField body="geometry" type="object">
+  Replacement GeoJSON geometry (`Polygon` or `MultiPolygon`). Replaces the existing geometry in PostGIS entirely.
+</ParamField>
+
+<ParamField body="categories" type="array of strings">
+  Replacement category filter list. Pass `null` to clear the filter and include all categories.
+</ParamField>
+
+<ParamField body="min_severity" type="float">
+  Updated minimum severity threshold. Must remain in `[0.0, 10.0]`.
+</ParamField>
+
+<ParamField body="is_active" type="boolean">
+  Manually toggle the active state of this AOI. Setting to `false` has the same effect as calling the `DELETE` endpoint.
+</ParamField>
+
+### Response — `200 OK`
+
+Returns the full updated `AoiResponse`. Returns `404` if the AOI does not exist.
+
+```bash
+curl -X PUT http://localhost:8000/v1/aoi/550e8400-e29b-41d4-a716-446655440000 \
+  -H "Content-Type: application/json" \
+  -d '{"min_severity": 5.0, "is_active": true}'
+```
+
+---
+
+## `DELETE /v1/aoi/{aoi_id}` — Soft-Delete AOI
+
+Deactivates an AOI by setting `is_active = false`. The AOI record is **never physically removed** from the database.
+
+### Path Parameters
+
+<ParamField path="aoi_id" type="string (UUID)" required>
+  The unique identifier of the AOI to deactivate.
+</ParamField>
+
+### Response — `204 No Content`
+
+Returns an empty body on success. Returns `404` if the AOI does not exist.
+
+```bash
+curl -X DELETE "http://localhost:8000/v1/aoi/550e8400-e29b-41d4-a716-446655440000"
+```
+
+<Note>
+  AOIs are soft-deleted by design. Setting `is_active = false` removes the AOI from all list and incident queries without destroying historical data or audit references. A deactivated AOI can be reactivated at any time by sending a `PUT` request with `{"is_active": true}`.
+</Note>
+
+---
+
+## `GET /v1/aoi/{aoi_id}/incidents` — List Incidents in AOI
+
+Returns a paginated list of active incidents whose `canonical_point` falls within the AOI's geometry, evaluated using PostGIS `ST_Intersects`. Only incidents with status `open` or `updated` are returned — `closed`, `false_positive`, and other terminal states are excluded.
+
+### Path Parameters
+
+<ParamField path="aoi_id" type="string (UUID)" required>
+  The unique identifier of the AOI to query.
+</ParamField>
+
+### Query Parameters
+
+<ParamField query="page" type="integer" default="1">
+  Page number to retrieve. Must be ≥ 1.
+</ParamField>
+
+<ParamField query="limit" type="integer" default="20">
+  Number of incidents per page. Maximum value is `100`.
+</ParamField>
+
+### Response — `200 OK`
+
+Returns an `IncidentListResponse` with `total`, `page`, and an `incidents` array. Returns `404` if the AOI does not exist.
+
+<Tip>
+  Incidents without a `canonical_point` (i.e. where coordinates could not be resolved) are automatically excluded from spatial queries. Ensure source data includes valid coordinates for full coverage.
+</Tip>
+
+```bash
+curl "http://localhost:8000/v1/aoi/550e8400-e29b-41d4-a716-446655440000/incidents"
+```
+
+---
+
+## AoiResponse Fields
+
+These fields are returned by all AOI endpoints that produce a response body.
+
+<ResponseField name="aoi_id" type="string (UUID)">
+  Unique identifier for this AOI, assigned at creation time.
+</ResponseField>
+
+<ResponseField name="name" type="string">
+  Human-readable label for the AOI.
+</ResponseField>
+
+<ResponseField name="description" type="string | null">
+  Optional free-text description. `null` if not provided at creation.
+</ResponseField>
+
+<ResponseField name="geometry" type="object">
+  The AOI boundary as a GeoJSON object. The `type` will be `"Polygon"` or `"MultiPolygon"`, with a `coordinates` array following the GeoJSON specification. Deserialized from PostGIS WKB on read.
+</ResponseField>
+
+<ResponseField name="categories" type="array of strings | null">
+  The category filter for this AOI. `null` means all categories are monitored.
+</ResponseField>
+
+<ResponseField name="min_severity" type="float">
+  Minimum severity score `[0.0, 10.0]` for incidents to appear in this AOI's incident queries.
+</ResponseField>
+
+<ResponseField name="is_active" type="boolean">
+  Whether this AOI is currently active. Inactive AOIs are excluded from list and incident queries.
+</ResponseField>
+
+<ResponseField name="created_by" type="string">
+  Identifier of the principal that created the AOI. Set to `"system"` for programmatically created AOIs.
+</ResponseField>
+
+<ResponseField name="created_at" type="string (ISO 8601 datetime)">
+  Timestamp of when the AOI was created, in UTC.
+</ResponseField>

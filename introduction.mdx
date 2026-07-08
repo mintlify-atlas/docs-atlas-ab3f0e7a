@@ -1,0 +1,70 @@
+---
+title: "GeoSentinel: Real-Time Geospatial Incident Monitoring"
+sidebarTitle: "Introduction"
+description: "GeoSentinel aggregates global events from GDELT, ACLED, FIRMS, and USGS into deduplicated incidents with a REST API and live Mapbox dashboard."
+---
+
+GeoSentinel is a real-time geospatial incident monitoring platform built for developers and operators who run situational-awareness systems. It continuously pulls events from GDELT Cloud v2, ACLED, FIRMS NASA, USGS, OpenSky (military flights), and AISStream (AIS vessels), normalises each raw record to a shared canonical model, deduplicates across sources, clusters related events using DBSCAN spatio-temporal grouping, and exposes the resulting incidents through a versioned REST API backed by PostgreSQL/PostGIS. A React dashboard with Mapbox GL JS renders incidents as live 2D/3D map layers with a virtualised incident list, spatial filtering by Area of Interest (AOI), and human-in-the-loop correction tools — making it equally useful as a stand-alone operations dashboard or as a data-pipeline backend for downstream analytics.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Clone the repo, start PostgreSQL, install dependencies, and pull your first real earthquake events in under 10 minutes.
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Deep-dive into the five-layer pipeline from raw source ingestion through DBSCAN clustering to the REST API.
+  </Card>
+  <Card title="Data Sources" icon="database" href="/data-sources/overview">
+    Details on each integrated source — polling frequencies, authentication, rate-limiting handling, and category mappings.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Full reference for every `/v1/` endpoint: incidents, AOI CRUD, corrections, health, seed, military flights, and AIS vessels.
+  </Card>
+</CardGroup>
+
+## Key Capabilities
+
+<CardGroup cols={3}>
+  <Card title="Multi-Source Ingestion" icon="arrows-to-circle">
+    Independent ingestors for GDELT, ACLED, FIRMS NASA, USGS, OpenSky military flights, and AISStream — each with retry/exponential backoff and isolated failure handling so one source outage never stalls the pipeline.
+  </Card>
+  <Card title="Canonical Normalisation" icon="sliders">
+    Every raw record — whether a USGS GeoJSON feature, an ACLED JSON payload, or a FIRMS CSV row — is mapped to the same `EventCanonicalCreate` Pydantic schema, with UTC timestamps, WGS84 coordinates, normalised severity (0–10), and source-independence class.
+  </Card>
+  <Card title="DBSCAN Spatio-Temporal Clustering" icon="circle-nodes">
+    Events are grouped into incidents using a mixed-metric DBSCAN: `d = w_space × (haversine_km / KM_MAX) + w_time × (Δhours / HOURS_MAX)`. Epsilon and weights are tunable per incident category; events from different categories are never merged regardless of proximity.
+  </Card>
+  <Card title="Incident Lifecycle State Machine" icon="arrow-progress">
+    Every incident flows through a fully audited state machine: `open → updated → stale → closed` or `false_positive`. All transitions — including manual operator corrections — are logged append-only in `corrections_audit`.
+  </Card>
+  <Card title="AOI Spatial Filtering" icon="map-location-dot">
+    Define named Areas of Interest as arbitrary GeoJSON polygons. The API exposes `GET /v1/aoi/{id}/incidents` backed by a PostGIS `ST_Intersects` query, and AOI geometry drives per-source fetch bounding boxes in the FIRMS ingestor.
+  </Card>
+  <Card title="Human-in-the-Loop Corrections" icon="user-check">
+    Operators can submit `false_positive`, `close`, `reclassify`, `relocate`, and `merge` corrections via `POST /v1/corrections`. Each correction is validated against the incident's current state and written to the immutable audit log.
+  </Card>
+</CardGroup>
+
+## Current Limitations
+
+<Warning>
+  GeoSentinel is an **MVP** — the following features are planned but not yet implemented:
+
+  - **No JWT authentication** — all API endpoints are currently public with no access control.
+  - **No API rate limiting** — the FastAPI application does not enforce per-client request limits.
+  - **No Prometheus metrics** — the `/metrics` scrape endpoint and per-ingestor counters (`ingestor_poll_total`, `ingestor_errors_total`) are not yet wired up.
+  - **No circuit breaker** — ingestor failures do not trip a circuit breaker; each poll retries independently with backoff.
+  - **Synchronous ingestor pipeline** — ingestors call the validation → normalisation → clustering pipeline synchronously. There is no Kafka or Redis Streams event bus yet; the architectural spec describes the target async design, but the current implementation is a direct in-process call.
+</Warning>
+
+## Data Licenses
+
+The following table summarises the licence terms for every data source integrated into GeoSentinel. Verify current terms with each provider before deploying in production.
+
+| Source | Licence | Key Restriction |
+|---|---|---|
+| FIRMS NASA | NASA Open Data — free use | Attribution required |
+| USGS Earthquake Hazards | Public domain | None |
+| GDELT Project | Public domain | None |
+| ACLED | CC BY-NC 4.0 | **Non-commercial use only** |
+| OpenSky Network | OpenSky Terms of Use | Non-commercial use permitted |
+| Mapbox GL JS | Commercial | Requires a valid Mapbox access token — usage limits apply per plan |

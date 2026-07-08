@@ -1,0 +1,131 @@
+---
+title: "Environment Variables Reference for GeoSentinel"
+sidebarTitle: "Environment Variables"
+description: "Complete reference for all GeoSentinel environment variables: database connection, API keys for each data source, relay URLs, and frontend build tokens."
+---
+
+GeoSentinel uses a single `.env` file at the project root to configure every service — the FastAPI backend, all ingestor scripts, the military and AIS relay microservices, and the React frontend build. Variables are loaded automatically at startup by `python-dotenv` in all Python processes; the frontend token is consumed by Vite at build time. In production the equivalent file is `.env.production`, loaded by each container via `env_file: .env.production` in `docker-compose.prod.yml`.
+
+<Warning>
+  Never commit `.env` or `.env.production` to version control. Both files contain secrets (API keys, database credentials, OAuth2 client secrets) and are listed in `.gitignore`. Store production secrets in a secrets manager or as encrypted environment variables in your CI/CD system.
+</Warning>
+
+## Full Template
+
+Copy this template to `.env` at the project root and fill in your values:
+
+```env
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/geosentinel
+FIRMS_MAP_KEY=your_firms_api_key
+GDELT_API_KEY=your_gdelt_api_key
+ACLED_USERNAME=your_acled_email
+ACLED_PASSWORD=your_acled_password
+AISSTREAM_API_KEY=your_aisstream_api_key
+OPENSKY_CLIENT_ID=your_opensky_client_id
+OPENSKY_CLIENT_SECRET=your_opensky_client_secret
+MILITARY_SOURCE=opensky
+MILITARY_RELAY_URL=http://localhost:8002
+VITE_MAPBOX_TOKEN=your_mapbox_token
+```
+
+## Variable Reference
+
+### Database
+
+<ParamField path="DATABASE_URL" type="string" required>
+  PostgreSQL connection string used by SQLAlchemy (backend API) and Alembic (migrations). Must point to a PostgreSQL 16 instance with the PostGIS extension enabled.
+
+  **Local development:** `postgresql://postgres:postgres@localhost:5432/geosentinel` matches the credentials in `docker-compose.yml`.
+
+  **Production:** update the host, user, and password to match your production PostgreSQL container. For example: `postgresql://admin:strongpassword@postgres:5432/geosentinel` when the backend and database share the `database_network` Docker network.
+</ParamField>
+
+### Data Source API Keys
+
+<ParamField path="FIRMS_MAP_KEY" type="string" required>
+  NASA FIRMS (Fire Information for Resource Management System) map key. Required for the `run_firms.py` ingestor, which polls active wildfire hotspots filtered by active AOI bounding boxes. The ingestor handles rate limiting (`429` responses) with exponential backoff and filters to type 0/1 hotspots only.
+
+  **How to get it:** Request a free map key at [https://firms.modaps.eosdis.nasa.gov/api/map_key/](https://firms.modaps.eosdis.nasa.gov/api/map_key/).
+</ParamField>
+
+<ParamField path="GDELT_API_KEY" type="string" required>
+  Bearer token for the GDELT Cloud Events v2 API (`gdeltcloud.com/api/v2`). Required for the `run_gdelt.py` ingestor, which fetches conflict events in 5-minute windows (up to 29 days back), maps CAMEO codes to internal categories, and deduplicates by `globalEventId`.
+
+  **How to get it:** Register and generate a key at your [GDELT Cloud dashboard](https://gdeltcloud.com/dashboard).
+</ParamField>
+
+<ParamField path="ACLED_USERNAME" type="string" required>
+  Email address registered with the Armed Conflict Location & Event Data (ACLED) project. Used together with `ACLED_PASSWORD` to obtain an OAuth2 Bearer token automatically. Required for the `run_acled.py` ingestor, which backfills 48 hours of structured conflict data and deduplicates by `event_id`.
+
+  **How to get it:** Register at [https://acleddata.com/myacled](https://acleddata.com/myacled).
+</ParamField>
+
+<ParamField path="ACLED_PASSWORD" type="string" required>
+  Password for the ACLED account identified by `ACLED_USERNAME`. The ingestor exchanges these credentials for a short-lived Bearer token via the ACLED OAuth2 endpoint.
+</ParamField>
+
+<ParamField path="AISSTREAM_API_KEY" type="string" required>
+  API key for the [AISStream](https://aisstream.io) WebSocket service. Required for the AIS relay microservice (`services/ais_relay/`) to receive real-time vessel position messages. If this key is absent or the connection drops, the relay automatically falls back to a mock data generator so the frontend AIS layer remains functional.
+
+  **How to get it:** Register and create an API key at [https://aisstream.io](https://aisstream.io).
+</ParamField>
+
+### Military Flight Relay
+
+<ParamField path="OPENSKY_CLIENT_ID" type="string" required>
+  OAuth2 client ID for the OpenSky Network API. Used by the military relay microservice (`services/military_relay/`) to authenticate against the OpenSky REST API and retrieve real-time state vectors for military aircraft. The relay enforces a 1 req/s rate limit to stay within OpenSky's usage policy.
+
+  **How to get it:** Create OAuth2 credentials in [My OpenSky → Account](https://opensky-network.org/my-opensky/account).
+</ParamField>
+
+<ParamField path="OPENSKY_CLIENT_SECRET" type="string" required>
+  OAuth2 client secret paired with `OPENSKY_CLIENT_ID`. Treat this like a password — never log it or expose it in error messages.
+
+  **How to get it:** Generated alongside `OPENSKY_CLIENT_ID` in the OpenSky account dashboard.
+</ParamField>
+
+<ParamField path="MILITARY_SOURCE" type="string" default="opensky">
+  Selects the data source for the military relay. Currently only `opensky` is supported. Reserved for future sources (e.g. ADS-B Exchange, local SDR receiver).
+
+  **Allowed values:** `opensky`
+</ParamField>
+
+<ParamField path="MILITARY_RELAY_URL" type="string" default="http://localhost:8002">
+  Base URL where the military relay microservice is listening. The FastAPI backend calls this URL to proxy `GET /v1/military-flights` requests. Change this in production to the container-internal address, e.g. `http://military-relay:8002` if services share a Docker network.
+</ParamField>
+
+### Frontend
+
+<ParamField path="VITE_MAPBOX_TOKEN" type="string" required>
+  Public token for Mapbox GL JS, used by the React frontend to render the interactive incident map, military flight layers, and AIS vessel layers. This token corresponds to a Mapbox account with the Maps API enabled.
+
+  **How to get it:** Create or copy a token from the [Mapbox console](https://console.mapbox.com/).
+</ParamField>
+
+<Note>
+  `VITE_MAPBOX_TOKEN` is a **build-time** variable. Vite inlines it into the compiled JavaScript bundle during `npm run build` (or during `docker compose ... --build` in production). It is **not** read from the filesystem at runtime — changing it requires a full frontend rebuild. In production, pass it explicitly on the command line:
+
+  ```bash
+  VITE_MAPBOX_TOKEN=pk.your_token_here docker compose -f docker-compose.prod.yml up -d --build frontend
+  ```
+</Note>
+
+## Variable Summary Table
+
+| Variable | Required | Default | Service |
+|----------|----------|---------|---------|
+| `DATABASE_URL` | ✅ | — | Backend, Alembic |
+| `FIRMS_MAP_KEY` | ✅ | — | FIRMS ingestor |
+| `GDELT_API_KEY` | ✅ | — | GDELT ingestor |
+| `ACLED_USERNAME` | ✅ | — | ACLED ingestor |
+| `ACLED_PASSWORD` | ✅ | — | ACLED ingestor |
+| `AISSTREAM_API_KEY` | ✅ | — | AIS relay |
+| `OPENSKY_CLIENT_ID` | ✅ | — | Military relay |
+| `OPENSKY_CLIENT_SECRET` | ✅ | — | Military relay |
+| `MILITARY_SOURCE` | Optional | `opensky` | Military relay |
+| `MILITARY_RELAY_URL` | Optional | `http://localhost:8002` | Backend |
+| `VITE_MAPBOX_TOKEN` | ✅ (build-time) | — | Frontend |
+
+<Warning>
+  **ACLED data is licensed under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/).** You may only use ACLED-sourced incident data for **non-commercial purposes**. Do not expose raw ACLED data or ACLED-derived incidents in any commercial product or service without explicit written authorisation from ACLED. See [ACLED's terms of use](https://acleddata.com/terms-of-use/) for full details.
+</Warning>

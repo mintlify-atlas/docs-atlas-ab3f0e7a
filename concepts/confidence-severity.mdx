@@ -1,0 +1,190 @@
+---
+title: "Confidence and Severity Scoring in GeoSentinel"
+sidebarTitle: "Confidence & Severity"
+description: "How GeoSentinel calculates incident confidence from source independence classes and severity from raw source metrics like Richter magnitude and fire radiative power."
+---
+
+Every event in GeoSentinel carries two normalized numeric scores: `severity` and `confidence`. Both are `FLOAT` values constrained to the range `[0.0, 10.0]` by `CHECK` constraints on both `events_canonical` and `incidents`. Severity measures the real-world impact of the event, derived from source-native physical or humanitarian metrics. Confidence measures how much trust to place in the observation, derived from the independence class of the contributing sources and — for media-derived sources — how many reports likely share the same origin article. These two scores enable API consumers to filter and prioritize incidents without understanding the specifics of each underlying data source.
+
+---
+
+## Severity
+
+Severity is calculated by each source mapper by translating a raw physical or humanitarian metric into the `[0.0, 10.0]` scale. The goal, as defined in the data model spec, is to enable meaningful comparison of severity across event categories — a severity 7.0 earthquake and a severity 7.0 conflict should represent roughly equivalent levels of impact.
+
+### Conflict (ACLED, GDELT)
+
+Conflict severity is derived from reported fatalities (ACLED) or from the GDELT Goldstein scale. The fatality-to-severity mapping:
+
+| Fatalities | Severity |
+|---|---|
+| 0 | 1.0 |
+| 1 – 5 | 3.0 |
+| 6 – 25 | 5.0 |
+| 26 – 100 | 7.0 |
+| 101 – 500 | 8.5 |
+| > 500 | 10.0 |
+
+### Earthquake (USGS)
+
+Earthquake severity maps directly from Richter scale magnitude:
+
+| Richter Magnitude | Severity |
+|---|---|
+| < 4.0 | 1.0 |
+| 4.0 – 5.0 | 3.5 |
+| 5.0 – 6.0 | 5.5 |
+| 6.0 – 7.0 | 7.5 |
+| > 7.0 | 10.0 |
+
+A magnitude 6.8 earthquake — capable of causing widespread structural damage — maps to severity 7.5. A minor magnitude 3.5 tremor (typically not felt) maps to 1.0.
+
+### Wildfire / Thermal Anomaly (FIRMS)
+
+FIRMS provides Fire Radiative Power (FRP) in megawatts, a direct measurement of energy released by the fire. GeoSentinel buckets this into severity levels:
+
+| FRP (MW) | Severity |
+|---|---|
+| < 50 MW | 2.0 |
+| 50 – 200 MW | 4.0 |
+| 200 – 1,000 MW | 6.5 |
+| > 1,000 MW | 9.0 |
+
+A low-intensity grass fire under 50 MW maps to 2.0. A major crown fire above 1,000 MW — comparable to some of the largest recorded wildfires — maps to 9.0.
+
+### At the Incident Level
+
+When multiple events are assigned to the same incident, two severity fields are maintained:
+
+| Field | Calculation | Meaning |
+|---|---|---|
+| `severity_max` | `max(events.severity)` | The peak severity recorded at any point in the incident's history. Never decreases. |
+| `severity_latest` | Severity of the most recently linked event | The current intensity of the incident. May decrease if the situation de-escalates. |
+
+<Info>
+  `severity_max` is appropriate for alerting and ranking (it captures the worst the incident has been). `severity_latest` is appropriate for displaying current status in a live dashboard.
+</Info>
+
+---
+
+## Confidence
+
+Confidence measures the reliability and independence of the sources supporting an incident. The fundamental principle — Design Decision D3 — is that two `media_derived` sources reporting the same event are almost certainly extracting from the same news article and therefore do not constitute independent corroboration. Confidence scoring penalizes this correlation.
+
+### Independence Classes
+
+Each source is assigned an independence class that determines its base weight in the confidence calculation:
+
+| Class | Weight Factor | Sources |
+|---|---|---|
+| `sensor` | ×2.0 | FIRMS, USGS, ADS-B, MarineTraffic — physical sensor data |
+| `field_reported` | ×1.5 | ACLED — field-verified reports from specialized organizations |
+| `media_derived` | ×0.5 | GDELT, Liveuamap — NLP-extracted from news media |
+
+```python
+SOURCE_INDEPENDENCE_CLASS = {
+    "usgs":         "sensor",
+    "firms":        "sensor",
+    "acled":        "field_reported",
+    "gdelt":        "media_derived",
+    "adsb":         "sensor",
+    "marinetraffic":"sensor",
+    "liveuamap":    "media_derived",
+}
+
+INDEPENDENCE_FACTORS = {
+    "sensor":         2.0,
+    "field_reported": 1.5,
+    "media_derived":  0.5,
+}
+```
+
+### 6-Hour News Cycle Penalty
+
+`media_derived` sources within the same 6-hour window from the same source are assumed to originate from the same news cycle. Additional articles from that window add very little independent information and are penalized with a 0.1× multiplier:
+
+```python
+def compute_confidence(events: list[EventsCanonical]) -> float:
+    score            = 0.0
+    seen_media_cycle = set()
+
+    for event in events:
+        source_class = SOURCE_INDEPENDENCE_CLASS.get(event.source, "media_derived")
+        factor       = INDEPENDENCE_FACTORS.get(source_class, 0.5)
+
+        if source_class == "media_derived":
+            # Round down to the nearest 6-hour boundary
+            cycle_window = event.event_time.replace(
+                hour     = (event.event_time.hour // 6) * 6,
+                minute   = 0,
+                second   = 0,
+                microsecond = 0,
+            )
+            cycle_key = f"{event.source}:{cycle_window.isoformat()}"
+            if cycle_key in seen_media_cycle:
+                factor *= 0.1   # strong redundancy penalty
+            seen_media_cycle.add(cycle_key)
+
+        score += factor
+
+    # Normalize: a single sensor observation (factor 2.0) → confidence ~6.7
+    # Two sensors → confidence ~10.0 (capped)
+    # Ten correlated media articles → well below two field_reported
+    max_expected = 3.0
+    return min(score * 10 / max_expected, 10.0)
+```
+
+### Calibration
+
+The `max_expected = 3.0` calibration constant was set so that:
+- **1 sensor source** (FIRMS or USGS alone): score 2.0 → confidence **6.7**
+- **2 sensor sources** (FIRMS + USGS): score 4.0 → confidence **10.0** (capped)
+- **1 field_reported** (ACLED alone): score 1.5 → confidence **5.0**
+- **10 correlated media articles** (GDELT, all same 6-hour window): first gets 0.5, each subsequent gets 0.05 → total ~0.95 → confidence **3.2**
+
+This satisfies Decision D3: ten GDELT extractions about the same event produce a lower confidence than two ACLED field reports.
+
+### Practical Examples
+
+<CardGroup cols={2}>
+  <Card title="Earthquake confirmed by two networks" icon="globe">
+    USGS primary report + USGS secondary network report (both `sensor`, 2.0 each).
+    Score: 4.0 → **confidence: 10.0**
+  </Card>
+  <Card title="Conflict with field + satellite" icon="shield">
+    ACLED field report (`field_reported`, 1.5) + FIRMS thermal anomaly (`sensor`, 2.0).
+    Score: 3.5 → **confidence: 10.0** (capped)
+  </Card>
+  <Card title="Media-only conflict" icon="newspaper">
+    5 GDELT extractions in the same 6-hour window.
+    Score: 0.5 + 0.05×4 = 0.7 → **confidence: 2.3**
+  </Card>
+  <Card title="Single FIRMS hotspot" icon="fire">
+    One FIRMS satellite detection, no corroborating sources.
+    Score: 2.0 → **confidence: 6.7**
+  </Card>
+</CardGroup>
+
+---
+
+## Using These Fields in Queries
+
+The `min_confidence` and `min_severity` query parameters on the incidents endpoint let you filter by these scores directly.
+
+```bash
+# Only show high-confidence incidents (sensor or field-verified corroboration)
+curl "http://localhost:8000/v1/incidents?min_confidence=7.0"
+
+# Severe conflict incidents (26+ fatalities or equivalent)
+curl "http://localhost:8000/v1/incidents?category=conflict&min_severity=6.0"
+
+# Major earthquakes with high confidence
+curl "http://localhost:8000/v1/incidents?category=disaster_natural&min_severity=7.5&min_confidence=8.0"
+
+# Active incidents in an area with meaningful severity
+curl "http://localhost:8000/v1/incidents?status=open&min_severity=3.0&bbox=-10,35,40,70"
+```
+
+<Note>
+  `fatalities_total` on an incident is calculated as `MAX(events.fatalities)`, not `SUM`. When ACLED, GDELT, and Liveuamap all report the same battle with 47 fatalities, summing them would yield 141. GeoSentinel takes the maximum (47) to represent the single best estimate of the true toll, avoiding inflated figures caused by multi-source reporting of the same event.
+</Note>

@@ -1,0 +1,147 @@
+---
+title: "GeoSentinel System Architecture Overview"
+sidebarTitle: "Architecture"
+description: "Five-layer pipeline from raw source ingestion through validation, normalization, clustering, and REST API delivery on PostgreSQL/PostGIS."
+---
+
+GeoSentinel is structured as a five-layer data pipeline that takes raw, heterogeneous event feeds from public and commercial APIs and produces a unified, deduplicated incident model queryable through a versioned REST API. Each layer has a single responsibility — ingestion, validation and quarantine, normalisation, clustering and lifecycle management, and API delivery — and layers communicate through the PostgreSQL/PostGIS database rather than in-memory state, making every stage independently re-executable and idempotent. The backend is built on FastAPI and SQLAlchemy 2.x; the frontend is a React 19 + Vite + Mapbox GL JS dashboard with Deck.gl WebGL layers.
+
+## Five-Layer Pipeline
+
+<Steps>
+  <Step title="Ingestion — backend/ingestors/">
+    Each external source has its own dedicated ingestor module under `backend/ingestors/`. Ingestors run as independent processes, fetch raw data on a per-source schedule, and pass results directly into the validation stage. Failures in one ingestor are fully isolated — they do not affect other sources.
+
+    **Polling schedules and source details:**
+
+    | Source | File | Frequency | Authentication |
+    |---|---|---|---|
+    | USGS | `usgs_ingestor.py` | Every 3 min | No key required |
+    | FIRMS NASA | `firms_ingestor.py` | Every 1 hour | `FIRMS_MAP_KEY` — handles HTTP 429 with backoff |
+    | GDELT Cloud v2 | `gdelt_ingestor.py` | Every 5 min | `GDELT_API_KEY` Bearer token |
+    | ACLED | `acled_ingestor.py` | Daily batch (48 h backfill) | OAuth2 Bearer via username/password |
+
+    All ingestors implement retry with exponential backoff. The FIRMS ingestor additionally filters fetch requests to the bounding box of active AOIs and restricts fire type to 0/1 (excluding less-reliable type 2/3 detections).
+  </Step>
+
+  <Step title="Validation & Quarantine — backend/validation/validator.py">
+    Every raw event passes through `validator.py` before it can enter the canonical store. Six rejection rules are applied:
+
+    | Rejection Code | Condition |
+    |---|---|
+    | `INVALID_COORDS` | Latitude outside `[-90, 90]` or longitude outside `[-180, 180]` |
+    | `NULL_COORDS` | `latitude` or `longitude` is `None` |
+    | `FUTURE_DATE` | `event_time` is later than the current UTC timestamp |
+    | `NULL_EVENT_TYPE` | `event_type` field is `None` or empty string |
+    | `NEGATIVE_FATALITIES` | `fatalities` field is a negative integer |
+    | `SCHEMA_ERROR` | Pydantic validation of the canonical schema fails |
+
+    Events that fail any rule are written to the `events_quarantine` table with the rejection code and the raw payload preserved for later inspection. Events that pass all rules proceed to normalisation.
+  </Step>
+
+  <Step title="Normalisation — backend/normalizers/">
+    Each source has a dedicated mapper module that converts the source-specific raw structure into a `EventCanonicalCreate` Pydantic model — the single canonical schema used everywhere in the pipeline.
+
+    | Mapper | Input Format | Key Mappings |
+    |---|---|---|
+    | `usgs_mapper.py` | USGS GeoJSON feature | Richter magnitude → severity; `properties.ids` → deduplication key |
+    | `firms_mapper.py` | FIRMS CSV row | FRP (MW) → severity; SHA-256 of row → deduplication key |
+    | `gdelt_mapper.py` | GDELT Events v2 JSON | CAMEO code → category/event_type; `globalEventId` → dedup key |
+    | `acled_mapper.py` | ACLED JSON | ACLED event type → internal category; `event_id` → dedup key |
+
+    Deduplication is enforced at the database layer via a `(source, event_id_source)` upsert — re-ingesting the same event only updates `ingest_time`. All timestamps are normalised to UTC in the mapper, never downstream.
+
+    The **source independence class** is assigned here and drives the confidence model: `sensor` sources (USGS, FIRMS) carry a ×2.0 weight, `field_reported` sources (ACLED) carry ×1.5, and `media_derived` sources (GDELT) carry ×0.5. Correlated media sources do not stack confidence linearly.
+  </Step>
+
+  <Step title="Clustering & Lifecycle — backend/jobs/">
+    After normalisation, canonical events are grouped into incidents by `clustering_job.py` using DBSCAN with a mixed spatio-temporal distance metric:
+
+    ```
+    d(e1, e2) = w_space × (haversine_km / KM_MAX) + w_time × (Δhours / HOURS_MAX)
+    ```
+
+    Epsilon, `KM_MAX`, `HOURS_MAX`, and the spatial/temporal weights are configured per incident category. Events from different categories are **never** merged regardless of geographic proximity. The `canonical_point` of each incident is computed as the centroid of its member events weighted by their individual `confidence` scores.
+
+    The **incident lifecycle** is managed by `incident_lifecycle.py`, which implements a full state machine:
+
+    - `open` — newly created or re-activated incident
+    - `updated` — received a new observation within the active window
+    - `stale` — no new observations for > 72 hours
+    - `closed` — manually closed by an operator correction
+    - `false_positive` — flagged by an operator; reversible back to `open`
+
+    Every state transition triggered by a `POST /v1/corrections` call is validated against the allowed transition graph and appended to `corrections_audit`.
+  </Step>
+
+  <Step title="API — backend/api/">
+    The FastAPI application (`backend/api/main.py`) mounts all routers under the `/v1/` prefix and serves the OpenAPI schema at `/docs` (Swagger UI) and `/redoc` (ReDoc). The API version is `1.0.0`.
+
+    **Available routers:**
+
+    | Router | Prefix | Description |
+    |---|---|---|
+    | `health.py` | `/v1/health` | Service and database health checks |
+    | `incidents.py` | `/v1/incidents` | List and detail endpoints with full filter set |
+    | `aoi.py` | `/v1/aoi` | Full CRUD for Areas of Interest + spatial incident query |
+    | `corrections.py` | `/v1/corrections` | Human-in-the-loop incident corrections |
+    | `military.py` | `/v1/military-flights` | Military flight tracking via OpenSky relay |
+    | `ais.py` | `/v1/ais-vessels` | AIS vessel positions via AISStream relay |
+    | `admin.py` | `/v1/admin/run` | Manually trigger ingestors or the full pipeline |
+    | `seed.py` | `/v1/seed` | Insert test sources and sample incidents |
+
+    CORS is configured with `allow_origins=["*"]` for development. The `GET /v1/incidents` endpoint supports the following query parameters: `bbox`, `category`, `status`, `since`, `min_severity`, `min_confidence`, `sources`, `aoi_id`, `include_fp`, `page`, and `limit`.
+  </Step>
+</Steps>
+
+## Technology Stack
+
+| Component | Technology |
+|---|---|
+| API framework | FastAPI 0.136+ |
+| Database | PostgreSQL 16 + PostGIS 3.4 |
+| ORM | SQLAlchemy 2.x + GeoAlchemy2 0.15+ |
+| Migrations | Alembic |
+| Data validation | Pydantic v2 |
+| Clustering | scikit-learn 1.6+ (DBSCAN) + NumPy 2.0+ |
+| Geometry operations | Shapely 2.0+ |
+| Python runtime | Python 3.12 / uv |
+| Frontend framework | React 19 + TypeScript + Vite 8 |
+| Map engine | Mapbox GL JS 3.x + react-map-gl 7 |
+| WebGL layers | Deck.gl 9 (ScatterplotLayer, HeatmapLayer, PathLayer, IconLayer) |
+| Server state | TanStack Query 5 |
+| Client state | Zustand 5 |
+| Styling | Tailwind CSS 3 |
+| Containerisation | Docker + Docker Compose |
+| Military flights relay | FastAPI microservice on port 8002 (OpenSky Network) |
+| AIS vessels relay | FastAPI microservice on port 8003 (AISStream WebSocket) |
+
+## Service Ports
+
+| Service | Port | Description |
+|---|---|---|
+| `backend` | 8000 | Main FastAPI application — incidents, AOI, corrections, health |
+| `military-relay` | 8002 | OpenSky relay — filters military ICAO24 hex codes, exposes `/v1/military-flights` |
+| `ais-relay` | 8003 | AISStream WebSocket relay + mock fallback for development |
+| `frontend` (dev) | 5173 | Vite dev server with HMR |
+| `frontend` (prod) | 80 | Nginx serving the React build; proxies `/v1/` to backend on port 8000 |
+| `postgres` | 5432 | PostgreSQL 16 + PostGIS 3.4 |
+
+## Database Schema
+
+GeoSentinel uses six tables managed by Alembic migrations. All timestamps are `TIMESTAMPTZ` stored in UTC; all geometry columns use WGS84 (EPSG:4326) with GIST spatial indexes.
+
+| Table | Purpose |
+|---|---|
+| `sources_metadata` | Registry of active data sources — name, type, last successful poll timestamp, and source-independence class used in the confidence model. |
+| `events_quarantine` | Rejected events with their rejection code (`INVALID_COORDS`, `NULL_COORDS`, `FUTURE_DATE`, `NULL_EVENT_TYPE`, `NEGATIVE_FATALITIES`, `SCHEMA_ERROR`) and raw payload preserved for debugging. |
+| `events_canonical` | The normalised event store. Every row is unique on `(source, event_id_source)`. Columns include `event_type`, `category`, `location_point` (PostGIS geometry), `severity`, `confidence`, `actors` (JSONB), and `fatalities`. |
+| `incidents` | DBSCAN-derived incident records. Each incident has a `canonical_point` centroid, `severity_max`, aggregate `confidence`, `sources[]` array, `linked_event_ids[]`, lifecycle `status`, and `first_seen`/`last_seen` timestamps. |
+| `aoi` | Named Areas of Interest defined as arbitrary GeoJSON polygon geometries. Stores `categories[]`, `min_severity` threshold, and an `is_active` flag. Spatial joins against this table drive both the `/v1/aoi/{id}/incidents` endpoint and ingestor bounding-box filtering. |
+| `corrections_audit` | Append-only audit log of every human correction applied to an incident. Each row records `incident_id`, `correction_type`, `reason`, `new_category`, `new_event_type`, operator identity (when auth is implemented), and `created_at`. |
+
+For the full column-level DDL and column constraints, see [Canonical Data Model](/concepts/canonical-model).
+
+<Note>
+  **MVP Architecture Note:** In the current implementation, ingestors call the validation → normalisation → clustering pipeline **synchronously** in-process. There is no Kafka or Redis Streams event bus yet — the architectural specification documents the intended async design, but the deployed code uses direct function calls. Additionally, JWT authentication and Prometheus metrics endpoints are not yet implemented; all API routes are currently public and unauthenticated. These gaps are tracked in the README under "Pendiente / Gaps conocidos".
+</Note>

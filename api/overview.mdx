@@ -1,0 +1,148 @@
+---
+title: "GeoSentinel REST API Reference Overview"
+sidebarTitle: "Overview"
+description: "GeoSentinel exposes a versioned REST API at /v1/ built on FastAPI. All endpoints return JSON. Interactive docs available at /docs and /redoc."
+---
+
+GeoSentinel is a real-time geospatial incident monitoring platform that aggregates events from multiple sources — including NASA FIRMS, USGS, GDELT, and ACLED — normalises them into a canonical model, applies spatio-temporal clustering, and exposes the results through a versioned REST API. Every resource is served as JSON and the full set of endpoints is publicly accessible without credentials.
+
+## Base URL
+
+All requests in local development target:
+
+```
+http://localhost:8000
+```
+
+In production the base URL depends on your deployment. GeoSentinel ships with a Docker Compose production configuration that places the backend behind an Nginx reverse proxy; refer to your `docker-compose.prod.yml` and your reverse-proxy host configuration for the exact domain.
+
+## Authentication
+
+<Warning>
+  JWT authentication is planned but **not yet implemented**. All endpoints are currently public and can be called without any credentials or `Authorization` header. Do not expose the API on an untrusted network until authentication is in place.
+</Warning>
+
+No API keys, bearer tokens, or session cookies are required. Every request can be made as a plain HTTP call.
+
+## Versioning
+
+All production endpoints are prefixed with `/v1/`. When breaking changes are introduced, a new prefix (e.g. `/v2/`) will be introduced without removing the previous version.
+
+```
+http://localhost:8000/v1/<resource>
+```
+
+## Interactive Documentation
+
+FastAPI automatically generates interactive API documentation from the OpenAPI schema. Three interfaces are available when the server is running:
+
+| Interface | URL |
+|-----------|-----|
+| Swagger UI | `http://localhost:8000/docs` |
+| ReDoc | `http://localhost:8000/redoc` |
+| OpenAPI JSON schema | `http://localhost:8000/openapi.json` |
+
+Swagger UI lets you execute requests directly from the browser. ReDoc provides a clean read-only reference view. The raw `openapi.json` can be imported into Postman, Insomnia, or any OpenAPI-compatible toolchain.
+
+## Response Format
+
+All responses are `application/json`. There are two general shapes:
+
+**Single-resource response** — a flat JSON object representing the requested entity.
+
+```json
+{
+  "incident_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "open",
+  "category": "wildfire",
+  ...
+}
+```
+
+**Paginated list response** — a JSON object that always includes the total record count, the current page, and a named array of items.
+
+```json
+{
+  "total": 84,
+  "page": 1,
+  "incidents": [ ... ]
+}
+```
+
+The name of the data array varies by resource (`incidents`, `aois`, etc.), but `total` and `page` are present on every paginated response.
+
+## Pagination
+
+All list endpoints accept two query parameters to control pagination:
+
+| Parameter | Type | Default | Maximum | Description |
+|-----------|------|---------|---------|-------------|
+| `page` | integer | `1` | — | 1-based page number |
+| `limit` | integer | `20` | `100` | Number of results per page |
+
+To iterate through all results, increment `page` until `page * limit >= total`.
+
+```bash
+# Page 1, 20 results (default)
+curl "http://localhost:8000/v1/incidents"
+
+# Page 3, 50 results per page
+curl "http://localhost:8000/v1/incidents?page=3&limit=50"
+```
+
+## Endpoints Summary
+
+<CardGroup cols={2}>
+  <Card title="Incidents" icon="triangle-exclamation" href="/api/incidents">
+    List and retrieve geospatial incidents aggregated from all ingestion sources. Supports spatial filtering, category, status, severity, and source filters.
+
+    `GET /v1/incidents`
+    `GET /v1/incidents/{incident_id}`
+  </Card>
+  <Card title="AOI" icon="draw-polygon" href="/api/aoi">
+    Manage Areas of Interest. Create, list, update, and soft-delete polygons used for spatial filtering and targeted ingestion.
+
+    `GET /v1/aoi`
+    `POST /v1/aoi`
+    `GET /v1/aoi/{aoi_id}`
+    `PUT /v1/aoi/{aoi_id}`
+    `DELETE /v1/aoi/{aoi_id}`
+  </Card>
+  <Card title="Corrections" icon="pen-to-square" href="/api/corrections">
+    Submit human-in-the-loop corrections to incidents. Supports false positive marking, manual closure, reclassification, relocation, and merge operations.
+
+    `POST /v1/corrections`
+  </Card>
+  <Card title="Military Flights" icon="plane" href="/api/military-flights">
+    Real-time military flight positions filtered by active AOIs. Sourced from the OpenSky Network relay microservice running on port 8002.
+
+    `GET /v1/military-flights`
+  </Card>
+  <Card title="AIS Vessels" icon="ship" href="/api/ais-vessels">
+    Real-time AIS vessel positions streamed from the AISStream relay microservice running on port 8003.
+
+    `GET /v1/ais-vessels`
+  </Card>
+  <Card title="Admin Jobs" icon="gears" href="/api/admin">
+    Trigger background jobs such as clustering and incident lifecycle transitions. Returns 409 if a job is already running.
+
+    `POST /v1/admin/run`
+  </Card>
+  <Card title="Health" icon="heart-pulse" href="/api/health">
+    Service and database health checks. Use these endpoints for liveness and readiness probes in container orchestration.
+
+    `GET /v1/health`
+    `GET /v1/health/db`
+  </Card>
+</CardGroup>
+
+## Error Codes
+
+GeoSentinel uses standard HTTP status codes for all error responses. Error bodies follow FastAPI's default format and include a `detail` field with a human-readable explanation.
+
+| Status Code | Meaning | Common Causes |
+|-------------|---------|---------------|
+| `400` | Bad Request | Malformed query parameter that cannot be parsed (e.g. an invalid `bbox` string) |
+| `404` | Not Found | The requested resource UUID does not exist in the database |
+| `409` | Conflict | An admin job was requested while the same job is already running |
+| `422` | Unprocessable Entity | Pydantic / FastAPI validation failure — one or more query or body parameters failed type or constraint checks (e.g. `limit=200` exceeds the maximum of 100) |

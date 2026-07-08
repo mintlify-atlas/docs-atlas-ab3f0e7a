@@ -1,0 +1,188 @@
+---
+title: "NASA FIRMS Active Fire Hotspot Ingestion"
+sidebarTitle: "FIRMS"
+description: "How GeoSentinel ingests NASA FIRMS wildfire hotspots: CSV polling, confidence-based FRP severity mapping, type 0/1 filter, and SHA-256 deduplication."
+---
+
+GeoSentinel polls the **NASA FIRMS** (Fire Information for Resource Management System) API every hour to ingest active fire and volcanic hotspots detected by satellite instruments. FIRMS aggregates near-real-time fire detections from two satellite-borne sensors: **VIIRS** (Visible Infrared Imaging Radiometer Suite) aboard the Suomi-NPP and NOAA-20 satellites at 375-meter resolution, and **MODIS** (Moderate Resolution Imaging Spectroradiometer) at 1-kilometer resolution. GeoSentinel defaults to the `VIIRS_SNPP_NRT` product for its higher spatial precision. Each hotspot detection includes a Fire Radiative Power (FRP) measurement in megawatts that drives GeoSentinel's severity score.
+
+## What FIRMS Is
+
+FIRMS ingests satellite thermal anomaly data and publishes it as near-real-time (NRT) CSV feeds. Each record represents a single satellite overpass detection of elevated thermal energy — either an active fire (`type=0`), a volcanic hotspot (`type=1`), an industrial or pipeline flare (`type=2`), or an offshore gas flare (`type=3`). GeoSentinel filters to types 0 and 1 only; types 2 and 3 are explicitly excluded as infrastructure noise rather than natural or conflict-linked fire events.
+
+<Note>
+FIRMS data has a NRT lag of approximately 3 hours from satellite overpass to API availability. The 1-hour polling interval is faster than data availability — on most polls the ingestor will receive zero new hotspots, which is expected behavior.
+</Note>
+
+## API Details
+
+The FIRMS CSV API constructs a dynamic URL embedding the map key, product, bounding box, and day count:
+
+```
+https://firms.modaps.eosdis.nasa.gov/api/area/csv/{FIRMS_MAP_KEY}/{PRODUCT}/{lon_min,lat_min,lon_max,lat_max}/{DAYS}/
+```
+
+| Property | Value |
+|---|---|
+| Base URL | `https://firms.modaps.eosdis.nasa.gov/api/area/csv` |
+| Default product | `VIIRS_SNPP_NRT` (375 m resolution) |
+| Alt product | `MODIS_NRT` (1 km resolution) |
+| Auth | `FIRMS_MAP_KEY` embedded in URL path |
+| Polling interval | Every **3 600 seconds** (1 hour) |
+| Default days lookback | 1 day |
+| Bounding box | Per active AOI (`lon_min, lat_min, lon_max, lat_max`) |
+
+To obtain a map key, register at [https://firms.modaps.eosdis.nasa.gov/api/map_key/](https://firms.modaps.eosdis.nasa.gov/api/map_key/).
+
+The URL is built at runtime by `_build_url()`:
+
+```python
+def _build_url(self, bbox: tuple[float, float, float, float], days: int = 1) -> str:
+    lon_min, lat_min, lon_max, lat_max = bbox
+    coords = f"{lon_min},{lat_min},{lon_max},{lat_max}"
+    return f"{FIRMS_BASE_URL}/{self.map_key}/{self.product}/{coords}/{days}/"
+```
+
+## AOI-Based Polling
+
+The ingestor fetches hotspots **per active AOI bounding box** rather than globally. Active AOIs are queried from PostGIS at each poll cycle:
+
+```python
+bboxes = get_active_aois(session)
+if not bboxes:
+    bboxes = [(-180, -90, 180, 90)]  # global fallback
+
+for bbox in bboxes:
+    result = ingestor.run(session, bbox=bbox)
+```
+
+This restricts satellite queries to monitored regions and avoids processing millions of hotspots from unmonitored areas.
+
+## Confidence Filter
+
+FIRMS reports a per-detection `confidence` field with values `low`, `nominal`, and `high`. GeoSentinel accepts only `nominal` and `high` detections:
+
+```python
+FIRMS_CONFIDENCE_FILTER = {"nominal", "high"}
+```
+
+Detections with `confidence=low` raise a `ValueError("Confidence '...' not in ...")` that the ingestor catches and counts as `skipped_low_confidence` — they are not quarantined but are silently dropped before validation.
+
+## Type Filter
+
+Only fire type `0` (vegetation fire / wildfire) and type `1` (volcanic hotspot) are ingested:
+
+```python
+FIRMS_TYPE_FILTER = {0, 1}
+```
+
+| FIRMS `type` | Meaning | GeoSentinel action |
+|---|---|---|
+| `0` | Vegetation fire / wildfire | ✅ Ingested — `event_type = "wildfire_hotspot"`, `category = WILDFIRE` |
+| `1` | Volcanic hotspot | ✅ Ingested — `event_type = "volcanic_hotspot"`, `category = OTHER` |
+| `2` | Other hotspot (industrial, pipeline) | ❌ Excluded — `skipped_invalid_type` counter |
+| `3` | Offshore hotspot (gas flare, offshore platform) | ❌ Excluded — `skipped_invalid_type` counter |
+
+## Severity Mapping
+
+Severity (0–10) is derived from **Fire Radiative Power (FRP)** in megawatts — a direct proxy for fire intensity and energy output:
+
+| FRP range (MW) | Severity |
+|---|---|
+| 0–3 MW | 1.0 |
+| 4–7 MW | 2.5 |
+| 8–24 MW | 5.0 |
+| 25–49 MW | 7.5 |
+| ≥ 50 MW | 10.0 |
+
+A 200 MW fire — comparable to a large forest fire crown run — would receive severity 10.0. A single burning field at 3 MW would receive severity 1.0.
+
+## Confidence Score Assignment
+
+The mapper assigns a numeric confidence based on the detection confidence label:
+
+```python
+confidence_value = 8.0 if confidence == "high" else 6.0
+```
+
+`high` confidence detections (strong thermal signal, satellite geometry favorable) receive 8.0. `nominal` detections receive 6.0.
+
+## Deduplication
+
+Because FIRMS has no stable row identifier, GeoSentinel generates a **SHA-256 hash** from the observation's physical fingerprint:
+
+```python
+def _generate_event_id(latitude, longitude, acq_date, acq_time, satellite) -> str:
+    key = f"{latitude}|{longitude}|{acq_date}|{acq_time}|{satellite}"
+    return hashlib.sha256(key.encode()).hexdigest()[:32]
+```
+
+The first 32 hex characters of the SHA-256 hash are used as `event_id_source`. The same satellite detection queried across multiple polls produces an identical hash, preventing duplicate insertion.
+
+## Location Accuracy
+
+Spatial accuracy varies by instrument:
+
+| Product | `location_accuracy_km` |
+|---|---|
+| `VIIRS_SNPP_NRT` (and variants) | 0.375 km (375 m) |
+| `MODIS_NRT` | 1.0 km |
+
+The mapper derives the accuracy from the product prefix:
+
+```python
+location_accuracy = LOCATION_ACCURACY.get(product.split("_")[0], 0.375)
+```
+
+## Event Timestamp Parsing
+
+Acquisition date and time are parsed together from separate FIRMS fields:
+
+```python
+def _parse_datetime(acq_date: str, acq_time: str) -> datetime:
+    acq_datetime = datetime.strptime(f"{acq_date} {acq_time.zfill(4)}", "%Y-%m-%d %H%M")
+    return acq_datetime.replace(tzinfo=timezone.utc)
+```
+
+`acq_time` is zero-padded to four digits (e.g., `"845"` → `"0845"` = 08:45 UTC).
+
+## Source References
+
+Each normalized FIRMS event includes the satellite and instrument in `source_refs`:
+
+```python
+source_refs = [
+    f"satellite: {satellite}",        # e.g. "N" for NOAA-20, "T" for Terra
+    f"instrument: {instrument}",      # e.g. "VIIRS"
+    f"brightness: {brightness}K",     # brightness temperature if available
+]
+```
+
+## Independence Class
+
+FIRMS is classified as **`sensor`** — carrying a **×2.0 confidence weight** during incident aggregation. Satellite thermal anomaly detections are direct physical measurements with no editorial intermediary. See [Independence Classes](/data-sources/overview#independence-classes).
+
+## Retry and Backoff
+
+The ingestor retries up to 5 times with exponential backoff (base 2, cap 60 seconds). HTTP 429 responses trigger the backoff loop. The `requests.Session` is pre-configured with `urllib3.util.retry.Retry` for transient 5xx errors.
+
+## Environment Variable
+
+```bash
+FIRMS_MAP_KEY=your_nasa_map_key   # from firms.modaps.eosdis.nasa.gov/api/map_key/
+```
+
+## Running the Ingestor
+
+```bash
+cd backend
+uv run python backend/scripts/run_firms.py
+```
+
+<Tip>
+To test the ingestor against a specific region without configuring AOIs in the database, call `FIRMSIngestor.run()` with an explicit `bbox` parameter:
+
+```python
+ingestor.run(session, bbox=(-10.0, 35.0, 5.0, 45.0), days=1)
+```
+</Tip>

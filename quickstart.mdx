@@ -1,47 +1,169 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with GeoSentinel in Minutes"
+sidebarTitle: "Quickstart"
+description: "Install GeoSentinel's full stack — PostgreSQL, FastAPI backend, and React frontend — and pull your first live incidents in under 10 minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+This guide walks you through standing up a complete GeoSentinel environment — database, backend API, and React dashboard — on your local machine. By the end you will have a running API at `http://localhost:8000`, a live dashboard at `http://localhost:5173`, seeded test incidents, and real USGS earthquake events flowing through the clustering pipeline.
 
 ## Prerequisites
 
-Before you begin, you must have:
+Before you begin, make sure you have the following installed and available:
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+- **Python 3.12+** managed via [`uv`](https://github.com/astral-sh/uv) — install `uv` with `pip install uv`
+- **Node.js 18+** for the React frontend
+- **Docker** and **Docker Compose** v2 — used to run PostgreSQL 16 + PostGIS 3.4
+- API credentials for the data sources you want to activate:
+  - **GDELT Cloud Events v2** — [gdeltcloud.com/dashboard](https://gdeltcloud.com/dashboard)
+  - **ACLED** — [acleddata.com/myacled](https://acleddata.com/myacled)
+  - **FIRMS NASA** — [firms.modaps.eosdis.nasa.gov/api/map_key](https://firms.modaps.eosdis.nasa.gov/api/map_key/)
+  - **OpenSky Network** (military flights relay) — [opensky-network.org/my-opensky/account](https://opensky-network.org/my-opensky/account)
+  - **Mapbox** (frontend map tiles) — [console.mapbox.com](https://console.mapbox.com/)
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Clone the repository and start PostgreSQL">
+    Clone the GeoSentinel repository and bring up the development database container. The `docker-compose.yml` in the project root runs `postgis/postgis:16-3.4` and exposes PostgreSQL on `localhost:5432`.
 
     ```bash
-    npm install your-package
+    git clone https://github.com/danizd/GeoSentinel.git
+    cd GeoSentinel
+    docker compose up -d
+    ```
+
+    Wait for the PostgreSQL health check to pass before continuing. You can confirm readiness with:
+
+    ```bash
+    docker compose ps
+    # The postgres service should show "(healthy)"
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Install Python backend dependencies">
+    GeoSentinel uses `uv` for reproducible Python environment management. Run `uv sync` from the `backend/` directory to install all dependencies into an isolated virtual environment.
 
     ```bash
-    your-cli init
+    cd backend
+    uv sync
     ```
+
+    Key runtime dependencies installed: FastAPI 0.136+, SQLAlchemy 2.x, GeoAlchemy2, Alembic, Pydantic v2, scikit-learn (DBSCAN), Shapely, psycopg3, and uvicorn.
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="Install frontend dependencies">
+    From the project root, move into the `frontend/` directory and install Node.js dependencies with npm.
 
     ```bash
-    your-cli start
+    cd frontend
+    npm install
     ```
+
+    This installs React 19, Vite 8, Mapbox GL JS 3.x, Deck.gl 9, TanStack Query 5, Zustand 5, and Tailwind CSS 3 — among others.
+  </Step>
+
+  <Step title="Create the .env file">
+    Create a `.env` file at the **project root** (not inside `backend/`). All ingestor scripts and the backend load environment variables from this location automatically via `python-dotenv`.
+
+    ```env
+    DATABASE_URL=postgresql://postgres:postgres@localhost:5432/geosentinel
+    FIRMS_MAP_KEY=your_firms_api_key_here
+    GDELT_API_KEY=your_gdelt_api_key_here
+    ACLED_USERNAME=your_acled_registered_email
+    ACLED_PASSWORD=your_acled_password
+    AISSTREAM_API_KEY=your_aisstream_api_key
+    OPENSKY_CLIENT_ID=your_opensky_client_id
+    OPENSKY_CLIENT_SECRET=your_opensky_client_secret
+    MILITARY_SOURCE=opensky
+    MILITARY_RELAY_URL=http://localhost:8002
+    VITE_MAPBOX_TOKEN=your_mapbox_public_token
+    ```
+
+    <Warning>
+      Never commit `.env` to version control. The repository's `.gitignore` excludes it, but double-check before pushing.
+    </Warning>
+
+    You only need to fill in the keys for the sources you plan to activate. `DATABASE_URL` and `VITE_MAPBOX_TOKEN` are required for the core stack; the ingestor-specific keys can be added as needed.
+  </Step>
+
+  <Step title="Run Alembic migrations">
+    Apply all database migrations to create the full schema — `sources_metadata`, `events_canonical`, `events_quarantine`, `incidents`, `aoi`, and `corrections_audit` — along with PostGIS geometry columns and GIST spatial indexes.
+
+    ```bash
+    cd backend
+    uv run alembic upgrade head
+    ```
+
+    A successful run prints each applied revision. If you see a PostGIS-related error, confirm the Docker container is healthy and that the `geosentinel` database exists.
+  </Step>
+
+  <Step title="Start the API and the frontend">
+    Open **two terminal windows** from the project root and start both services:
+
+    **Terminal 1 — FastAPI backend (port 8000):**
+
+    ```bash
+    cd backend
+    uv run uvicorn backend.api.main:app --reload --host 0.0.0.0 --port 8000
+    ```
+
+    **Terminal 2 — React frontend (port 5173):**
+
+    ```bash
+    cd frontend
+    npm run dev
+    ```
+
+    Once both are running:
+    - API root: [http://localhost:8000](http://localhost:8000)
+    - Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
+    - ReDoc: [http://localhost:8000/redoc](http://localhost:8000/redoc)
+    - Dashboard: [http://localhost:5173](http://localhost:5173)
+  </Step>
+
+  <Step title="Seed test data">
+    Populate the database with the built-in source metadata records and three sample incidents (one conflict, one earthquake, one wildfire) to verify that the API and dashboard are wired up correctly.
+
+    ```bash
+    curl http://localhost:8000/v1/seed
+    ```
+
+    The endpoint returns a JSON summary of rows inserted. Refresh the dashboard — you should see markers appear on the map.
+  </Step>
+
+  <Step title="Pull real USGS earthquake events">
+    Run the USGS ingestor to download and process real earthquake events from the last 24 hours (magnitude ≥ 4.0). This is the fastest source to test because USGS requires no API key.
+
+    ```bash
+    cd backend
+    uv run python backend/scripts/run_usgs.py
+    ```
+
+    The script prints a summary of events fetched, validated, and inserted into `events_canonical`.
+  </Step>
+
+  <Step title="Run the clustering job">
+    After ingesting raw events, run the clustering job to group them into incidents using DBSCAN. This is what populates the `incidents` table and what the dashboard and `/v1/incidents` endpoint query.
+
+    ```bash
+    cd backend
+    uv run python backend/scripts/run_clustering.py
+    ```
+
+    The job prints the number of new incidents created and existing incidents updated. Head to [http://localhost:5173](http://localhost:5173) — the USGS earthquake incidents will now appear on the map as clustered markers.
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Available Ingestor Scripts
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+Each ingestor script lives under `backend/scripts/` and can be run independently. All scripts auto-load the `.env` from the project root.
+
+| Script | Source | Requires | Notes |
+|---|---|---|---|
+| `run_usgs.py` | USGS Earthquake Hazards | No API key | Pulls last 24 h, magnitude ≥ 4.0 |
+| `run_firms.py` | FIRMS NASA (active fires) | `FIRMS_MAP_KEY` | Processes last day's hotspots for active AOIs |
+| `run_gdelt.py` | GDELT Cloud v2 (conflict) | `GDELT_API_KEY` | Downloads last 24 h of conflict events by zone |
+| `run_acled.py` | ACLED (structured conflict) | `ACLED_USERNAME`, `ACLED_PASSWORD` | 48-hour batch backfill via OAuth2 Bearer |
+| `run_clustering.py` | — (internal job) | Database populated | DBSCAN grouping; run after any ingestor |
+
+<Tip>
+  For a full development environment guide — including optional services like the military-flight relay (port 8002), the AIS relay (port 8003), and production Docker Compose configuration — see [Local Development Setup](/deployment/local-setup).
 </Tip>

@@ -1,0 +1,286 @@
+---
+title: "Incident Lifecycle State Machine"
+sidebarTitle: "Incident Lifecycle"
+description: "The five-state machine GeoSentinel uses to manage incident status from open through updated, stale, closed, and false_positive with valid transitions."
+---
+
+Every incident in GeoSentinel moves through a defined set of states over its lifetime. A newly clustered incident starts as `open`. When a new observation arrives, it briefly enters `updated` — a transient signal that the incident is actively receiving data — before settling back to `open`. If no new observations arrive for 72 hours, the incident becomes `stale`. Operators can close resolved incidents, reopen them, or flag them as `false_positive` to exclude them from the public API. All state changes that involve operator action are recorded in the append-only `corrections_audit` table. The lifecycle job (`backend/jobs/incident_lifecycle.py`) runs periodically to apply time-driven transitions automatically.
+
+---
+
+## States
+
+| State | Description |
+|---|---|
+| `open` | The incident is active. At least one observation has been received within the last `INCIDENT_STALE_HOURS` (default: 72 hours). This is the default state for all newly created incidents. |
+| `updated` | A transient state entered whenever a new `events_canonical` record is linked to the incident. Signals real-time activity. Automatically reverts to `open` after 15 minutes via the lifecycle job. |
+| `stale` | No new observations have arrived for longer than `INCIDENT_STALE_HOURS`. The incident remains in the database and is visible via the API; it is not deleted. A new observation reactivates it to `open`. |
+| `closed` | The incident is confirmed as ended, either by an operator action or a configurable business rule. Unlike `stale`, `closed` implies intentional termination. Requires an audit record. Can be reopened by an operator. |
+| `false_positive` | Flagged by a human operator as a detection error — the underlying event did not actually occur as reported. Excluded from the public API by default (include only when `include_fp=true` is passed). Requires an audit record in `corrections_audit`. |
+
+The status values are implemented in `backend/models/incidents.py` as string constants:
+
+```python
+class IncidentStatus:
+    OPEN           = "open"
+    UPDATED        = "updated"
+    STALE          = "stale"
+    CLOSED         = "closed"
+    FALSE_POSITIVE = "false_positive"
+```
+
+---
+
+## State Transitions
+
+```
+             new observation
+   ┌─────────────────────────────────────────┐
+   │                                         │
+[open] ──new obs──► [updated] ──15 min──► [open]
+   │                                         │
+   │  > STALE_HOURS without obs              │  > STALE_HOURS without obs
+   ▼                                         ▼
+[stale] ◄────────────────────────────────────┘
+   │
+   ├──── new observation ──► [open]   (reactivation)
+   │
+   └──── manual close ──────► [closed]
+
+[open | updated | stale] ──operator──► [false_positive]
+[false_positive] ──operator──► [open]  (reversal)
+[closed] ──operator──► [open]          (reopen)
+```
+
+---
+
+## Transition Rules
+
+### `* → updated`
+
+**Trigger:** A new `event_canonical` record is associated with the incident by the clustering job (via `assign_event_to_incident()`).
+
+**Actions performed atomically:**
+- `last_seen` is updated to `max(current last_seen, event.event_time)`.
+- `observation_count` is incremented.
+- `sources` array is updated to include the new source.
+- `severity_latest` is set to the new event's severity.
+- `severity_max` is updated if the new event's severity exceeds the current maximum.
+- `fatalities_total` is updated to `max(current, event.fatalities)`.
+- `confidence` is recalculated over all linked events.
+- `canonical_point` is recomputed as the confidence-weighted centroid.
+
+```python
+def transition_to_updated(session: Session, incident: Incident) -> Incident:
+    incident.status           = "updated"
+    incident.status_changed_at = datetime.now(timezone.utc)
+    incident.last_updated     = datetime.now(timezone.utc)
+    session.commit()
+    return incident
+```
+
+---
+
+### `updated → open`
+
+**Trigger:** 15 minutes have elapsed since the last transition to `updated` (i.e., `status_changed_at < now() - 15 minutes`).
+
+**Implementation:** The lifecycle job queries all incidents with `status = "updated"` and `status_changed_at < threshold`, then calls `transition_to_open()` with `reason="auto_transition_after_15min"`.
+
+```python
+UPDATE_TO_OPEN_MINUTES = 15
+
+updated_incidents = session.execute(
+    select(Incident).where(
+        Incident.status == "updated",
+        Incident.status_changed_at < now - timedelta(minutes=UPDATE_TO_OPEN_MINUTES),
+    )
+).scalars().all()
+```
+
+---
+
+### `open | updated → stale`
+
+**Trigger:** `now() - last_seen > INCIDENT_STALE_HOURS` (default: `INCIDENT_STALE_HOURS = 72`).
+
+**Condition:** The incident's `status` must be `open` or `updated`. An already-`stale`, `closed`, or `false_positive` incident is not affected.
+
+**Note:** Incidents are **never deleted** when they go stale. They remain queryable via the API with `status=stale`.
+
+```python
+INCIDENT_STALE_HOURS = 72
+
+def transition_to_stale(session: Session, incident: Incident) -> Incident:
+    if incident.status not in ["open", "updated"]:
+        raise ValueError(f"Invalid transition from {incident.status} to stale")
+    incident.status            = "stale"
+    incident.status_changed_at = datetime.now(timezone.utc)
+    session.commit()
+    return incident
+```
+
+---
+
+### `stale → open` (Reactivation)
+
+**Trigger:** A new observation enters the cluster of a `stale` incident (i.e., a new `events_canonical` record is close enough in space-time to be assigned to the incident).
+
+**Condition:** The new observation's `event_time` must fall within the active clustering window for its category.
+
+**Effect:** The incident transitions directly to `updated` (via `transition_to_updated()`) and then to `open` after 15 minutes. The transition is logged with `reason='new_observation'`.
+
+---
+
+### `* → false_positive`
+
+**Trigger:** Operator action via `POST /v1/corrections` with `correction_type = "false_positive"`.
+
+**Mandatory:** A row must be inserted into `corrections_audit` with the `before_state`, `after_state`, `corrected_by` (operator user ID), and an optional `reason`.
+
+**Effect:** The incident is excluded from the default API response. It is only returned when the caller explicitly passes `include_fp=true`.
+
+```python
+def transition_to_false_positive(
+    session: Session, incident: Incident,
+    corrected_by: str, reason: str | None = None
+) -> Incident:
+    before_state = {"status": incident.status, "last_seen": incident.last_seen.isoformat()}
+    incident.status            = "false_positive"
+    incident.status_changed_at = datetime.now(timezone.utc)
+    session.commit()
+    correction = CorrectionsAudit(
+        incident_id     = incident.incident_id,
+        corrected_by    = corrected_by,
+        correction_type = "false_positive",
+        before_state    = before_state,
+        after_state     = {"status": "false_positive"},
+        reason          = reason,
+    )
+    session.add(correction)
+    session.commit()
+    return incident
+```
+
+---
+
+### `false_positive → open` (Reversal)
+
+**Trigger:** Operator action via `POST /v1/corrections` to reverse a false-positive designation.
+
+**Condition:** `incident.status` must be exactly `"false_positive"`.
+
+**Implementation:** Calls `resolve_false_positive()`, which sets `status = "open"` and creates an audit record with `correction_type = "reclassify"`.
+
+```python
+def resolve_false_positive(
+    session: Session, incident: Incident,
+    corrected_by: str, reason: str | None = None
+) -> Incident:
+    if incident.status != "false_positive":
+        raise ValueError(f"Cannot resolve false_positive from status {incident.status}")
+    # ... sets status = "open" and writes audit record
+```
+
+---
+
+### `* → closed`
+
+**Trigger:** Operator action via `POST /v1/corrections` with `correction_type = "close"`, or a configurable business rule (e.g., event source officially closes the record).
+
+**Difference from `false_positive`:** `closed` means the incident genuinely occurred but has ended. `false_positive` means the incident should not have been created at all.
+
+**Audit:** A `corrections_audit` record with `correction_type = "close"` is always created.
+
+---
+
+### `closed → open` (Reopen)
+
+**Trigger:** Operator action via `POST /v1/corrections` to reopen a mistakenly closed incident.
+
+**Condition:** `incident.status` must be exactly `"closed"`. The lifecycle job does **not** automatically reopen closed incidents.
+
+**Implementation:** Calls `reopen_closed()`, which validates the current status, sets `status = "open"`, and creates an audit record.
+
+```python
+def reopen_closed(
+    session: Session, incident: Incident,
+    corrected_by: str, reason: str | None = None
+) -> Incident:
+    if incident.status != "closed":
+        raise ValueError(f"Cannot reopen incident with status {incident.status}")
+    # ... sets status = "open" and writes audit record
+```
+
+---
+
+## Invalid Transitions
+
+The following transitions raise a `ValueError` when attempted. They cannot be executed by the lifecycle job or the clustering job — only an explicit operator correction can override them.
+
+```python
+INVALID_TRANSITIONS = {
+    "closed":         ["open", "updated", "stale"],
+    # closed → open is only valid via reopen_closed() (operator-initiated)
+    # closed → updated or stale are never valid under any path
+
+    "false_positive": ["updated", "stale"],
+    # false_positive can only go to open (via resolve_false_positive)
+}
+```
+
+| From | To | Result |
+|---|---|---|
+| `closed` | `open` (automatic) | `ValueError` — must use `reopen_closed()` with `corrected_by` |
+| `closed` | `updated` | `ValueError` — always invalid |
+| `closed` | `stale` | `ValueError` — always invalid |
+| `false_positive` | `updated` | `ValueError` — always invalid |
+| `false_positive` | `stale` | `ValueError` — always invalid |
+| `stale` | `updated` | `ValueError` — `transition_to_stale` guards against this |
+| `false_positive` | `open` (automatic) | `ValueError` — must use `resolve_false_positive()` with `corrected_by` |
+
+---
+
+## Running the Lifecycle Job
+
+The lifecycle job is implemented in `backend/jobs/incident_lifecycle.py`:
+
+```bash
+python -m backend.jobs.incident_lifecycle
+```
+
+It reads `DATABASE_URL` from the environment and performs two passes:
+
+1. **Stale pass:** Finds all `open` or `updated` incidents where `last_seen < now() - 72 hours`. Calls `transition_to_stale()` for each.
+2. **Updated-to-open pass:** Finds all `updated` incidents where `status_changed_at < now() - 15 minutes`. Calls `transition_to_open()` with `reason="auto_transition_after_15min"` for each.
+
+```python
+def run_lifecycle_job(session: Session) -> dict[str, Any]:
+    now              = datetime.now(timezone.utc)
+    stale_threshold  = now - timedelta(hours=INCIDENT_STALE_HOURS)     # 72 h
+    updated_threshold = now - timedelta(minutes=UPDATE_TO_OPEN_MINUTES) # 15 min
+
+    # Pass 1: mark stale
+    stale_incidents = session.execute(
+        select(Incident).where(
+            Incident.status.in_(["open", "updated"]),
+            Incident.last_seen < stale_threshold,
+        )
+    ).scalars().all()
+
+    # Pass 2: reset updated → open
+    updated_incidents = session.execute(
+        select(Incident).where(
+            Incident.status == "updated",
+            Incident.status_changed_at < updated_threshold,
+        )
+    ).scalars().all()
+
+    return {"stale_transitions": N, "updated_to_open": M}
+```
+
+The job returns a summary: `{"stale_transitions": N, "updated_to_open": M}`.
+
+<Tip>
+  For questions about operator-initiated transitions (`false_positive`, `closed`, `reopen`), see the [Corrections API reference](/api/corrections).
+</Tip>

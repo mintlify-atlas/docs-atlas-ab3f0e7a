@@ -1,0 +1,176 @@
+---
+title: "Corrections API: Human-in-the-Loop Incident Management"
+sidebarTitle: "Corrections"
+description: "POST /v1/corrections applies operator corrections to incidents: false_positive, close, reclassify, relocate, and merge — all recorded in an append-only audit trail."
+---
+
+The Corrections API is GeoSentinel's human-in-the-loop override mechanism. Automated ingestion pipelines aggregate raw signals into incidents, but operators retain full authority to correct the system's output: flagging false positives, closing resolved events, reclassifying misidentified incidents, relocating those with bad coordinates, or merging duplicates into a single canonical record. Every correction — regardless of type — produces an immutable entry in the `corrections_audit` table, capturing a `before_state` and `after_state` snapshot of the incident so the full history of operator decisions is always recoverable.
+
+---
+
+## `POST /v1/corrections`
+
+Applies an operator correction to an existing incident. The `correction_type` field determines which mutation is performed.
+
+### Request Body
+
+<ParamField body="incident_id" type="string (UUID)" required>
+  The UUID of the incident to correct. Returns `404` if the incident does not exist.
+</ParamField>
+
+<ParamField body="correction_type" type="string" required>
+  The type of correction to apply. Must be one of: `false_positive`, `close`, `reclassify`, `relocate`, `merge`.
+</ParamField>
+
+<ParamField body="reason" type="string" required>
+  A human-readable explanation for the correction. Written to the audit trail and must be non-empty. Used to provide context for future reviewers of the `corrections_audit` record.
+</ParamField>
+
+<ParamField body="new_category" type="string">
+  The replacement category for the incident. Only used when `correction_type` is `reclassify` and the incident is not currently in `false_positive` status.
+</ParamField>
+
+<ParamField body="new_event_type" type="string">
+  The replacement event type for the incident. Only used with `correction_type=reclassify`.
+</ParamField>
+
+<ParamField body="new_coordinates" type="object">
+  An object with `lon` (float) and `lat` (float) keys specifying the corrected location. Required when `correction_type` is `relocate`. Longitude must be in `[-180, 180]` and latitude in `[-90, 90]`.
+
+  ```json
+  { "lon": -3.7, "lat": 40.4 }
+  ```
+</ParamField>
+
+<ParamField body="target_incident_id" type="string (UUID)">
+  The UUID of the incident to merge into. Required when `correction_type` is `merge`. The source incident's `linked_event_ids` will be transferred to the target and the source will be set to `closed`.
+</ParamField>
+
+---
+
+### `false_positive`
+
+Marks the incident as a false positive, transitioning its `status` to `false_positive`. This signals that the underlying event either never occurred or was based on erroneous source data. False positive incidents are excluded from default API results across all incident listing endpoints — pass `include_fp=true` on those queries to include them. The transition is reversible: a subsequent `reclassify` correction will restore the incident to `open` status.
+
+```bash
+curl -X POST http://localhost:8000/v1/corrections \
+  -H "Content-Type: application/json" \
+  -d '{
+    "incident_id": "550e8400-e29b-41d4-a716-446655440000",
+    "correction_type": "false_positive",
+    "reason": "Duplicate report from unverified source"
+  }'
+```
+
+---
+
+### `close`
+
+Transitions the incident to `closed` status, indicating that the real-world event has ended. Unlike `false_positive`, this does **not** challenge whether the event occurred — it confirms it happened and is now resolved. Use this when an ongoing incident (e.g. a wildfire, a conflict engagement) has been confirmed as finished.
+
+```bash
+curl -X POST http://localhost:8000/v1/corrections \
+  -H "Content-Type: application/json" \
+  -d '{
+    "incident_id": "550e8400-e29b-41d4-a716-446655440000",
+    "correction_type": "close",
+    "reason": "Confirmed ended"
+  }'
+```
+
+---
+
+### `reclassify`
+
+Corrects the classification of an incident. The behaviour depends on the incident's current status:
+
+- **If the incident is `false_positive`**: reverses the false positive flag and sets the incident back to `open`. The `new_category` and `new_event_type` fields are ignored in this case.
+- **Otherwise**: updates the incident's `category` and/or `event_type` to the provided values. At least one of `new_category` or `new_event_type` should be supplied.
+
+```bash
+curl -X POST http://localhost:8000/v1/corrections \
+  -H "Content-Type: application/json" \
+  -d '{
+    "incident_id": "550e8400-e29b-41d4-a716-446655440000",
+    "correction_type": "reclassify",
+    "new_category": "wildfire",
+    "new_event_type": "wildfire_hotspot",
+    "reason": "Misclassified by media source"
+  }'
+```
+
+---
+
+### `relocate`
+
+Replaces the incident's `canonical_point` with operator-supplied coordinates. Use this when the aggregated location is known to be incorrect — for example, when a GDELT article was geocoded to the wrong city, or when a sensor reported coordinates with offset errors.
+
+The `new_coordinates` field is required and must contain `lon` and `lat` keys. The system validates that the longitude is within `[-180, 180]` and the latitude within `[-90, 90]`, returning `400 Bad Request` if either bound is exceeded.
+
+```bash
+curl -X POST http://localhost:8000/v1/corrections \
+  -H "Content-Type: application/json" \
+  -d '{
+    "incident_id": "550e8400-e29b-41d4-a716-446655440000",
+    "correction_type": "relocate",
+    "new_coordinates": {"lon": -3.7, "lat": 40.4},
+    "reason": "Incorrect coordinates from GDELT"
+  }'
+```
+
+---
+
+### `merge`
+
+Merges two incidents that represent the same real-world event. All `linked_event_ids` from the source incident (identified by `incident_id`) are transferred to the target incident (`target_incident_id`). Duplicate event IDs are not added twice. The target's `observation_count` is recalculated after the transfer, and the source incident's `status` is set to `closed`.
+
+`target_incident_id` is required for this correction type. The endpoint returns `400 Bad Request` if it is absent, and `404` if the target incident does not exist.
+
+```bash
+curl -X POST http://localhost:8000/v1/corrections \
+  -H "Content-Type: application/json" \
+  -d '{
+    "incident_id": "aaaaaaaa-0000-0000-0000-000000000001",
+    "correction_type": "merge",
+    "target_incident_id": "bbbbbbbb-0000-0000-0000-000000000002",
+    "reason": "Same event reported separately"
+  }'
+```
+
+---
+
+## Response — `200 OK`
+
+All corrections return a `CorrectionResponse` object.
+
+<ResponseField name="correction_id" type="string (UUID)">
+  Unique identifier for this audit record, assigned at write time.
+</ResponseField>
+
+<ResponseField name="incident_id" type="string (UUID)">
+  The UUID of the incident that was corrected.
+</ResponseField>
+
+<ResponseField name="correction_type" type="string">
+  The type of correction that was applied. One of `false_positive`, `close`, `reclassify`, `relocate`, `merge`.
+</ResponseField>
+
+<ResponseField name="before_state" type="object">
+  A JSONB snapshot of the incident's `status`, `category`, `event_type`, and `canonical_point` captured immediately before the correction was applied.
+</ResponseField>
+
+<ResponseField name="after_state" type="object">
+  A JSONB snapshot of the same fields captured immediately after the correction was applied.
+</ResponseField>
+
+<ResponseField name="reason" type="string | null">
+  The operator-supplied explanation for the correction.
+</ResponseField>
+
+<ResponseField name="created_at" type="string (ISO 8601 datetime)">
+  Timestamp of when the correction audit record was created, in UTC.
+</ResponseField>
+
+<Note>
+  The `corrections_audit` table is **append-only**. Once a correction record is written, it is never updated or deleted — not even by subsequent corrections to the same incident. Each correction produces its own independent row, giving you a complete, ordered history of every operator decision ever made on an incident.
+</Note>

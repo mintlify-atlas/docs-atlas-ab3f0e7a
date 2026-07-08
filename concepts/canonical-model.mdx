@@ -1,0 +1,276 @@
+---
+title: "Canonical Event Model: GeoSentinel's Unified Schema"
+sidebarTitle: "Canonical Model"
+description: "How GeoSentinel normalizes raw events from six sources into a single EventCanonicalCreate schema with UTC timestamps, WGS84 coordinates, and typed categories."
+---
+
+GeoSentinel ingests data from six structurally different sources — GDELT, ACLED, FIRMS, USGS, ADS-B, and MarineTraffic — each with its own timestamp format, coordinate convention, event vocabulary, and confidence characteristics. Without a unifying layer, downstream processing (clustering, severity scoring, the API) would need to understand every source independently. The canonical model solves this by requiring every source mapper to emit a single `EventCanonicalCreate` object before any data is written to `events_canonical`. All dates are UTC, all coordinates are WGS84, all categories come from a fixed enum, and all severity and confidence values are normalized to the `[0.0, 10.0]` range.
+
+---
+
+## EventCanonicalCreate Schema
+
+Every source mapper must return an object that validates against the `EventCanonicalCreate` Pydantic model defined in `backend/schemas/events.py`. The validation layer (`backend/validation/validator.py`) then runs the six rejection rules before the event is persisted.
+
+```python
+from datetime import datetime
+from enum import Enum
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+class CategoryEnum(str, Enum):
+    CONFLICT        = "conflict"
+    DISASTER_NATURAL = "disaster_natural"
+    WILDFIRE        = "wildfire"
+    MOBILITY        = "mobility"
+    HUMANITARIAN    = "humanitarian"
+    THERMAL_ANOMALY = "thermal_anomaly"
+    OTHER           = "other"
+
+
+class Actor(BaseModel):
+    role:       str
+    name:       str
+    cameo_code: str | None = None
+
+
+class EventCanonicalCreate(BaseModel):
+    # Identity
+    event_id_source:      str
+    source:               str
+    # Temporality — always timezone-aware UTC
+    event_time:           datetime
+    # Classification
+    event_type:           str | None = None
+    category:             CategoryEnum
+    # Geography (WGS84)
+    latitude:             float
+    longitude:            float
+    location_accuracy_km: float | None = None
+    admin1:               str | None   = None
+    admin2:               str | None   = None
+    country_iso2:         str | None   = None
+    geometry:             dict[str, Any] | None = None
+    geometry_type:        GeometryTypeEnum | None = None
+    # Actors
+    actors:               list[Actor] | None = None
+    # Metrics
+    fatalities:           int | None = None
+    severity:             float = Field(..., ge=0.0, le=10.0)
+    confidence:           float = Field(..., ge=0.0, le=10.0)
+    # Source provenance
+    source_url:           str | None        = None
+    source_refs:          list[str] | None  = None
+    # Flags
+    is_confirmed:         bool = False
+    is_rumor:             bool = False
+    raw_payload:          dict[str, Any] | None = None
+```
+
+<Note>
+  Validation constraints on `latitude`, `longitude`, `severity`, `confidence`, and `event_type` are intentionally **not** enforced by Pydantic field validators. This allows malformed events to reach `validate_event()` in `backend/validation/validator.py`, where they are routed to `events_quarantine` rather than raising an unhandled exception.
+</Note>
+
+### Field Reference
+
+<ParamField body="event_id_source" type="string" required>
+  The source-native identifier for this event. Used together with `source` to form the composite unique key `(source, event_id_source)` that drives deduplication. See the [Deduplication](#deduplication) section for how each source constructs this key.
+</ParamField>
+
+<ParamField body="source" type="string" required>
+  Lowercase source identifier. One of: `gdelt`, `acled`, `firms`, `usgs`, `adsb`, `marinetraffic`, `liveuamap`. Must match a row in the `sources_metadata` table.
+</ParamField>
+
+<ParamField body="event_time" type="datetime" required>
+  The moment the real-world event occurred. **Always timezone-aware UTC** — the mapper is responsible for normalization before populating this field. See [UTC Normalization](#utc-normalization) for per-source conversion rules.
+</ParamField>
+
+<ParamField body="event_type" type="string">
+  Fine-grained classification within the category. Examples: `conflict_battle`, `conflict_explosion`, `wildfire_hotspot`, `earthquake`. Mapped from each source's native vocabulary by the mapper. Events with a null or empty `event_type` are rejected with `NULL_EVENT_TYPE`.
+</ParamField>
+
+<ParamField body="category" type="CategoryEnum" required>
+  Coarse-grained event category. One of `conflict`, `disaster_natural`, `wildfire`, `mobility`, `humanitarian`, `thermal_anomaly`, `other`. The clustering job processes each category in isolation — see [Category Isolation](/concepts/clustering#category-isolation).
+</ParamField>
+
+<ParamField body="latitude" type="float" required>
+  WGS84 latitude in decimal degrees. Must be in `[-90, 90]`; null or out-of-range values are rejected.
+</ParamField>
+
+<ParamField body="longitude" type="float" required>
+  WGS84 longitude in decimal degrees. Must be in `[-180, 180]`.
+</ParamField>
+
+<ParamField body="location_accuracy_km" type="float">
+  Estimated radius of positional uncertainty in kilometres. USGS provides this natively; FIRMS hotspots have a nominal 375 m or 1 km pixel depending on satellite. Used in canonical-point calculation inside the clustering job.
+</ParamField>
+
+<ParamField body="country_iso2" type="string">
+  ISO 3166-1 alpha-2 country code, e.g. `UA`, `SD`, `US`. Populated by the mapper via reverse geocoding or source metadata. Used as a fast filter in the API and AOI matching.
+</ParamField>
+
+<ParamField body="admin1" type="string">
+  First-level administrative division name (state, province, oblast). Optional but populated whenever the source provides it.
+</ParamField>
+
+<ParamField body="actors" type="list[Actor]">
+  List of actor objects involved in the event. Each actor carries a canonical `role` (see Actor Roles below), a human-readable `name`, and an optional `cameo_code`. Never reject an event because an actor's code is unrecognized — use `role='unknown'` and preserve the original name.
+</ParamField>
+
+<ParamField body="fatalities" type="integer">
+  Reported fatality count. `null` means unknown; `-1` is the ACLED convention for "unknown" and is explicitly allowed. Values below `-1` are rejected with `NEGATIVE_FATALITIES`.
+</ParamField>
+
+<ParamField body="severity" type="float" required>
+  Normalized severity in `[0.0, 10.0]`. Computed by each mapper from source-native metrics (magnitude, FRP, fatality count). See [Confidence & Severity](/concepts/confidence-severity).
+</ParamField>
+
+<ParamField body="confidence" type="float" required>
+  Per-event confidence in `[0.0, 10.0]`. Reflects the source's independence class and data quality. See [Confidence & Severity](/concepts/confidence-severity).
+</ParamField>
+
+<ParamField body="source_url" type="string">
+  Canonical URL of the source record for human review (ACLED event page, USGS event detail page, etc.).
+</ParamField>
+
+<ParamField body="source_refs" type="list[string]">
+  Array of supplementary references or notes. Mappers use this to annotate date normalization decisions — for example, ACLED mappers append a note like `"date_only:2024-01-15 → 00:00:00 UTC assumed"`.
+</ParamField>
+
+<ParamField body="is_rumor" type="boolean" default="false">
+  Set to `true` when the source explicitly flags the event as unconfirmed or rumoured. GDELT media events may set this when Goldstein scale or tone indicates low reliability.
+</ParamField>
+
+---
+
+## Event Categories
+
+The `category` field is enforced by a `CHECK` constraint on the `events_canonical` table. Clustering, severity bucketing, and API filters all operate on these values.
+
+| Category | Description | Primary Sources |
+|---|---|---|
+| `conflict` | Armed conflict, battles, explosions, violence against civilians | ACLED, GDELT, Liveuamap |
+| `disaster_natural` | Floods, storms, landslides, volcanic activity | GDELT, ReliefWeb |
+| `wildfire` | Forest fires and vegetation fires detected by satellite | FIRMS |
+| `mobility` | Aircraft and maritime vessel movements of interest | ADS-B, MarineTraffic |
+| `humanitarian` | Displacement, refugee flows, humanitarian crises | ACLED, ReliefWeb |
+| `thermal_anomaly` | Industrial heat anomalies distinct from wildfires | FIRMS |
+| `other` | Events that do not fit the above categories | Any |
+
+<Warning>
+  Events from different categories are **never** clustered together, even if they are geographically and temporally adjacent. A wildfire and a conflict battle happening at the same coordinates at the same time will produce two separate incidents.
+</Warning>
+
+---
+
+## Validation Rules
+
+Before a mapper's output reaches `events_canonical`, it passes through `validate_event()` in `backend/validation/validator.py`. Any rule violation routes the raw payload to `events_quarantine` with the corresponding rejection code and detail string.
+
+```python
+REJECTION_CODES = {
+    "INVALID_COORDS":      "Coordinates out of valid range",
+    "NULL_COORDS":         "Latitude or longitude is null",
+    "FUTURE_DATE":         "event_time is more than 1 hour in the future",
+    "NULL_EVENT_TYPE":     "event_type is null or empty",
+    "NEGATIVE_FATALITIES": "fatalities value is invalid (< -1)",
+    "SCHEMA_ERROR":        "Failed to parse raw payload",
+}
+```
+
+| Code | Rejection Condition |
+|---|---|
+| `INVALID_COORDS` | `latitude < -90` or `latitude > 90` or `longitude < -180` or `longitude > 180` |
+| `NULL_COORDS` | `latitude is None` or `longitude is None` |
+| `FUTURE_DATE` | `event_time > now() + 1 hour` (1-second tolerance applied to account for processing latency) |
+| `NULL_EVENT_TYPE` | `event_type is None` or `str(event_type).strip() == ""` |
+| `NEGATIVE_FATALITIES` | `fatalities < -1` (`-1` is the ACLED unknown-fatalities sentinel and is permitted) |
+| `SCHEMA_ERROR` | Raw payload failed Pydantic parsing before reaching the validator |
+
+The actual validation logic from `backend/validation/validator.py`:
+
+```python
+def validate_event(event: EventCanonicalCreate) -> ValidationResult:
+    now = datetime.now(timezone.utc)
+    future_threshold = now + timedelta(hours=1) - timedelta(seconds=1)
+
+    if event.latitude is None or event.longitude is None:
+        return ValidationResult(is_valid=False, rejection_code="NULL_COORDS",
+            rejection_detail="latitude or longitude is null")
+
+    if event.latitude < -90 or event.latitude > 90:
+        return ValidationResult(is_valid=False, rejection_code="INVALID_COORDS",
+            rejection_detail=f"latitude {event.latitude} out of range [-90, 90]")
+
+    if event.longitude < -180 or event.longitude > 180:
+        return ValidationResult(is_valid=False, rejection_code="INVALID_COORDS",
+            rejection_detail=f"longitude {event.longitude} out of range [-180, 180]")
+
+    if event.event_time > future_threshold:
+        return ValidationResult(is_valid=False, rejection_code="FUTURE_DATE",
+            rejection_detail=f"event_time {event.event_time} is more than 1 hour in the future")
+
+    if event.event_type is None or not str(event.event_type).strip():
+        return ValidationResult(is_valid=False, rejection_code="NULL_EVENT_TYPE",
+            rejection_detail="event_type is null or empty")
+
+    if event.fatalities is not None and event.fatalities < -1:
+        return ValidationResult(is_valid=False, rejection_code="NEGATIVE_FATALITIES",
+            rejection_detail=f"fatalities value {event.fatalities} is invalid (minimum allowed is -1)")
+
+    return ValidationResult(is_valid=True, event=event)
+```
+
+Quarantined events are stored with their full `raw_payload` so an operator or automated job can inspect, correct, and re-enqueue them. A quarantine alert fires when more than 100 unresolved records accumulate within a 30-minute window.
+
+---
+
+## UTC Normalization
+
+Every source uses a different timestamp convention. Normalization to UTC happens **inside the mapper**, never afterward. The table below shows the conversion for each active source:
+
+| Source | Original Field | Original Format | Conversion |
+|---|---|---|---|
+| ACLED | `event_date` | `YYYY-MM-DD` (date only, no time) | Assign `00:00:00 UTC`; append note to `source_refs` |
+| GDELT | `SQLDATE` | `YYYYMMDD` integer | Parse as date, assign `00:00:00 UTC` |
+| FIRMS | `acq_date` + `acq_time` | `YYYY-MM-DD` + `HHMM` | Combine and interpret directly as UTC |
+| USGS | `properties.time` | Epoch milliseconds | `datetime.fromtimestamp(ms / 1000, tz=UTC)` |
+| ADS-B | `t` | Unix epoch seconds | `datetime.fromtimestamp(t, tz=UTC)` |
+| MarineTraffic | `TIMESTAMP` | ISO 8601 with UTC offset | Convert offset to UTC |
+
+<Note>
+  ACLED and GDELT provide only a date, not a time. By convention, GeoSentinel assigns midnight UTC (`00:00:00 UTC`) and records this assumption in `source_refs`. Downstream consumers must treat these timestamps as **date-precision only**.
+</Note>
+
+---
+
+## Deduplication
+
+The `events_canonical` table enforces a `UNIQUE(source, event_id_source)` constraint. Before inserting, the pipeline checks whether a record with the same composite key already exists:
+
+- **Exists** → update `ingest_time` if the payload changed; do not create a duplicate.
+- **Does not exist** → insert.
+
+The deduplication window covers the last **60 days** (`DEDUP_WINDOW_DAYS=60`) to catch retroactive corrections, which ACLED publishes regularly.
+
+| Source | `event_id_source` Construction |
+|---|---|
+| GDELT | `GLOBALEVENTID` cast to text |
+| ACLED | `data_id` cast to text |
+| FIRMS | `sha256(lat \| lon \| acq_date \| acq_time \| satellite)[:32]` — synthetic key because FIRMS has no native ID |
+| USGS | `properties.ids.split(",")[0].strip(",")` — first preferred ID from the comma-separated list |
+| ADS-B | `hex + ":" + t` (ICAO hex code + Unix timestamp) |
+| MarineTraffic | `mmsi + ":" + TIMESTAMP` |
+| Liveuamap | `id` cast to text |
+
+The FIRMS synthetic key is computed as:
+
+```python
+import hashlib
+
+def firms_event_id(row: dict) -> str:
+    key = f"{row['latitude']}|{row['longitude']}|{row['acq_date']}|{row['acq_time']}|{row['satellite']}"
+    return hashlib.sha256(key.encode()).hexdigest()[:32]
+```

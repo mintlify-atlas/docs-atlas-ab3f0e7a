@@ -1,0 +1,171 @@
+---
+title: "Military Flight Tracking via OpenSky Relay"
+sidebarTitle: "Military Flights"
+description: "How GeoSentinel's military-relay microservice filters OpenSky ADS-B data to identify military aircraft using a monthly ICAO24 hex database of ~10,000 entries."
+---
+
+GeoSentinel tracks military aircraft activity in real time through a dedicated **military-relay** microservice that polls the OpenSky Network ADS-B API and filters the full state vector feed down to confirmed military aircraft. The relay is a FastAPI microservice running on port 8002 that maintains its own aircraft identification logic, database, and cache — exposing a clean internal API that the main backend queries per active AOI bounding box. Rather than relying on callsigns (which generate too many false positives) or national hex code ranges (which miss many operated aircraft), the relay uses a monthly-updated database of approximately 10,000 ICAO24 hexadecimal transponder codes confirmed as military operator/owner entries in OpenSky's own aircraft registry.
+
+## Architecture
+
+```
+OpenSky Network (ADS-B)
+       ↓  OPENSKY_CLIENT_ID + OPENSKY_CLIENT_SECRET
+ military-relay (FastAPI, port 8002)
+       ├── Downloads OpenSky aircraft DB monthly (~108 MB, S3)
+       ├── Extracts military ICAO24 hex codes → data/military_hex.txt
+       ├── Polls /api/states/all?lamin=...&lamax=...&lomin=...&lomax=...
+       ├── Filters: category==7 OR hex in military_hex.txt
+       ├── Caches filtered results per bbox (TTL: 300s)
+       └── Exposes GET /api/military/v1/list-military-flights
+              ↓
+ main backend (MilitaryIngestor)
+       └── GET /v1/military-flights → frontend
+```
+
+The main backend's `MilitaryIngestor` queries all active AOI bounding boxes in sequence, deduplicates by flight event ID, and maps each flight to a canonical event.
+
+## Military Identification Strategy
+
+The relay determines if an aircraft is military using three criteria, checked in priority order:
+
+### 1. ADS-B Category 7 (highest priority)
+
+The ICAO ADS-B standard defines **category 7** as "Military — Fixed Wing." If an aircraft broadcasts `category=7` in its ADS-B state vector, it is immediately classified as military, regardless of hex code or callsign:
+
+```python
+if category == 7:
+    return True
+```
+
+### 2. ICAO24 Hex Database Lookup (primary method)
+
+The hex database at `data/military_hex.txt` contains approximately 10,000 six-character ICAO24 transponder codes compiled from OpenSky's aircraft registry using military operator and owner keywords. Each line is a single uppercase hex code:
+
+```
+AE1234
+3C4A7F
+43C9B2
+...
+```
+
+Lookups are O(1) via a Python `set` loaded with `@lru_cache(maxsize=1)`:
+
+```python
+def is_hex_military(hex_code: str | None) -> bool:
+    if not hex_code:
+        return False
+    normalized = hex_code.strip().upper().replace("-", "").replace(" ", "")
+    return normalized in load_military_hex_set()
+```
+
+### 3. Why Not Callsigns or National Hex Ranges
+
+**Callsigns** like `RCH123` or `REACH456` are used extensively, but are also adopted by civilian charters, contractors, and exercise participants — producing unacceptable false-positive rates. The filter comment in the source explicitly notes: *"El filtro de callsign se omite deliberadamente: con 10 000+ hex codes de la BD de OpenSky, los callsigns tácticos generan demasiados falsos positivos."*
+
+**National hex ranges** (e.g., `AE0000–AFFFFF` for the USA, `43C000–43CFFF` for the UK RAF) are defined in `config.py` and available via `is_hex_military_by_range()`, but are also not used as primary classification — national blocks contain civilian government, coast guard, and other non-combat aircraft that would inflate military event counts.
+
+<Info>
+The callsign list (`CALLSIGN_PREFIXES_FULL`) in `config.py` contains 80+ verified military prefixes from community-verified FR24 data (RAF, Luftwaffe, IAF, NATO AWACS, USAF, USN, etc.) and is maintained for future use, but is not part of the active `is_military()` classification path.
+</Info>
+
+## Monthly Database Auto-Update
+
+At relay startup, GeoSentinel checks `data/military_hex.txt` and rebuilds it if any of the following conditions are met:
+
+- The file does not exist
+- The file is more than **30 days old**
+- The file contains fewer than **1,000 entries** (indicating a corrupt or truncated download)
+
+The update process downloads OpenSky's monthly aircraft database from an S3 endpoint (~108 MB compressed), parses the `operator` and `owner` fields, and extracts entries matching `MILITARY_OPERATOR_KEYWORDS`. The resulting ICAO24 hex codes are written to `data/military_hex.txt` (~10,000 entries after filtering).
+
+## Rate Limiting
+
+The relay enforces a **1 request/second** ceiling on all OpenSky API calls, matching OpenSky's free tier rate limit. Requests are throttled at the relay layer so the main backend can query the relay as frequently as needed without triggering 429s upstream.
+
+## Event ID Generation
+
+Each military flight event is assigned a time-bucketed ID that deduplicates across the 60-second poll interval:
+
+```python
+def military_event_id(self, hex_code: str, last_seen_at: str) -> str:
+    ts = datetime.fromisoformat(last_seen_at.replace("Z", "+00:00"))
+    ts_60 = int(ts.timestamp() // 60) * 60
+    return f"{hex_code.upper()}:{ts_60}"
+```
+
+Two poll cycles within the same 60-second window for the same aircraft produce the same event ID — the pipeline upserts rather than duplicates.
+
+## Severity and Anomaly Escalation
+
+Base severity for military flights is `3.0`. The ingestor escalates severity under three conditions:
+
+| Condition | Severity floor |
+|---|---|
+| Flight is within 50 km of an active conflict incident (`check_incident_proximity`) | 7.0 |
+| Flight is flagged `isInteresting=true` by the relay | 6.0 |
+| ≥ 3 military aircraft within 100 km radius (`check_cluster`) | 5.0 |
+
+These conditions are evaluated in the main `MilitaryIngestor`, not in the relay itself.
+
+## Frontend API Endpoint
+
+The main backend exposes military flight data through:
+
+```
+GET /v1/military-flights
+```
+
+This endpoint queries all active AOI bounding boxes in sequence via `MilitaryIngestor.fetch_from_relay()`:
+
+```
+GET /api/military/v1/list-military-flights
+  ?neLat={max_lat}&neLon={max_lon}&swLat={min_lat}&swLon={min_lon}
+```
+
+The relay returns a `flights` array and a `clusters` array. If relay data is stale (cache older than TTL), the response includes `X-Stale: true` and the ingestor logs a warning.
+
+## Debug Endpoint
+
+The relay exposes a `/debug` endpoint on port 8002 for diagnostics:
+
+```bash
+curl http://localhost:8002/debug
+```
+
+This returns the current hex database size, cache status, last OpenSky poll time, and any configuration warnings.
+
+## Environment Variables
+
+```bash
+OPENSKY_CLIENT_ID=your_opensky_client_id
+OPENSKY_CLIENT_SECRET=your_opensky_client_secret
+MILITARY_SOURCE=opensky             # relay source selector
+MILITARY_RELAY_URL=http://localhost:8002   # backend → relay URL
+```
+
+Register for OpenSky credentials at [https://opensky-network.org/my-opensky/account](https://opensky-network.org/my-opensky/account).
+
+## Starting the Relay
+
+```bash
+python -m services.military_relay.main
+```
+
+The relay starts on port 8002. At startup it will trigger a background database update if `data/military_hex.txt` is missing, stale, or undersized.
+
+## Force a Manual Database Update
+
+To immediately rebuild `data/military_hex.txt` from the latest OpenSky aircraft database:
+
+```bash
+python -m services.military_relay.update_military_db
+```
+
+<Warning>
+The OpenSky monthly database download is approximately 108 MB. The update script may take several minutes on a slow connection. The relay continues serving stale hex data from the existing `military_hex.txt` during the download.
+</Warning>
+
+<Note>
+OpenSky Network data is subject to the [OpenSky Terms of Use](https://opensky-network.org/about/terms-of-service). Non-commercial use is permitted. Individual ICAO24 hex codes (`hexCode` field) are never exposed in GeoSentinel's public `/v1/incidents` API — only aggregated event data is surfaced.
+</Note>

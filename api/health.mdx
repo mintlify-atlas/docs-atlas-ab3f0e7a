@@ -1,0 +1,105 @@
+---
+title: "Health Check Endpoints for GeoSentinel"
+sidebarTitle: "Health"
+description: "GET /v1/health returns service status. GET /v1/health/db checks database connectivity. GET /v1/seed loads test incidents for development."
+---
+
+GeoSentinel exposes three lightweight diagnostic endpoints: a basic liveness check that confirms the API process is running, a database connectivity probe that executes a round-trip `SELECT 1` against PostgreSQL, and a development seed route that populates the database with a minimal set of known-good incidents. These endpoints require no request body and carry no side effects in the case of the health probes — making them safe to call from load balancers, uptime monitors, and CI pipelines.
+
+---
+
+## `GET /v1/health`
+
+Returns the service's liveness status. This endpoint does not touch the database and will respond as long as the FastAPI process is alive. Use it as a shallow heartbeat check in orchestration environments (Kubernetes `livenessProbe`, load balancer health targets, etc.).
+
+```bash
+curl http://localhost:8000/v1/health
+```
+
+### Response — `200 OK`
+
+```json
+{"status": "healthy", "service": "geosentinel"}
+```
+
+<ResponseField name="status" type="string">
+  Always `"healthy"` when the API process is running and able to handle requests.
+</ResponseField>
+
+<ResponseField name="service" type="string">
+  The service identifier. Always `"geosentinel"`.
+</ResponseField>
+
+---
+
+## `GET /v1/health/db`
+
+Verifies database connectivity by executing `SELECT 1` against the configured PostgreSQL instance via SQLAlchemy. Use this as a deeper readiness check when you need to confirm that the full data path is operational — for example, as a Kubernetes `readinessProbe` or in a deployment smoke test.
+
+```bash
+curl http://localhost:8000/v1/health/db
+```
+
+### Response — `200 OK` (connected)
+
+```json
+{"status": "healthy", "database": "connected"}
+```
+
+### Response — `200 OK` (disconnected)
+
+When the database query raises an exception, the endpoint still returns HTTP `200` but the body reflects the failure state and includes the raw error message.
+
+```json
+{"status": "unhealthy", "database": "disconnected", "error": "connection refused"}
+```
+
+<ResponseField name="status" type="string">
+  `"healthy"` if the `SELECT 1` query succeeded; `"unhealthy"` if an exception was raised.
+</ResponseField>
+
+<ResponseField name="database" type="string">
+  `"connected"` on success; `"disconnected"` on failure.
+</ResponseField>
+
+<ResponseField name="error" type="string">
+  Present only when the database probe fails. Contains the string representation of the exception raised by SQLAlchemy.
+</ResponseField>
+
+---
+
+## `GET /v1/seed`
+
+Inserts a fixed set of sample records into the database for development and testing purposes. The endpoint is idempotent with respect to source metadata — it checks for an existing `SourcesMetadata` row before inserting and skips the source insertion if records are already present. Incident records are always inserted on each call.
+
+The following data is seeded on each invocation:
+
+**Source metadata** (inserted only if no sources exist yet):
+- `gdelt` — GDELT Cloud Events v2 (`media_derived`)
+- `usgs` — USGS Earthquake Hazards (`sensor`)
+- `firms` — FIRMS NASA VIIRS/MODIS (`sensor`)
+- `acled` — ACLED CC BY-NC 4.0 (`field_reported`)
+
+**Sample incidents** (always inserted):
+
+| Category | Event Type | Location |
+|---|---|---|
+| `conflict` | `conflict_battle` | 40.0°N, 3.0°W |
+| `disaster_natural` | `earthquake` | 35.0°N, 120.0°W |
+| `wildfire` | `wildfire_hotspot` | 45.0°N, 110.0°W |
+
+All seeded incidents are created with `status = "open"` and include `severity_max`, `severity_latest`, `confidence`, `source_count`, and `observation_count` fields populated with representative values.
+
+```bash
+curl http://localhost:8000/v1/seed
+```
+
+### Response — `200 OK`
+
+```json
+{"message": "Seeded 3 test incidents"}
+```
+
+<Warning>
+  The `/v1/seed` endpoint is intended for local development and integration testing only. It inserts data unconditionally on every call and does not enforce any environment guards. Do not expose this endpoint in production deployments — remove it from routing or protect it behind a network policy before going live.
+</Warning>

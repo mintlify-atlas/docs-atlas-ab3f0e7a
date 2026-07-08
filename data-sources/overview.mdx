@@ -1,0 +1,96 @@
+---
+title: "Data Sources: How GeoSentinel Ingests Global Events"
+sidebarTitle: "Overview"
+description: "GeoSentinel pulls from six open-data sources — GDELT, ACLED, FIRMS, USGS, OpenSky, and AISStream — each polled on independent schedules with automatic retry."
+---
+
+GeoSentinel aggregates geospatial incident data from six distinct open-data sources, each operating on its own independent polling cycle with exponential backoff and automatic retry logic. Every event passes through a shared normalization pipeline — mapped to the internal `EventCanonicalCreate` schema — then validated, deduplicated by `(source, event_id_source)`, and written to `events_canonical` before being clustered into incidents. The sources are deliberately heterogeneous: media-derived conflict reports, field-verified conflict data, satellite fire detections, seismic sensor feeds, ADS-B military aircraft positions, and real-time AIS vessel telemetry. This diversity is intentional — no single source dominates the confidence calculation.
+
+## Source Comparison
+
+| Source | Category | Poll Frequency | Independence Class | API Key Required |
+|---|---|---|---|---|
+| GDELT Cloud v2 | Conflict / Political | Every 5 minutes | `media_derived` | Yes — GDELT Cloud |
+| ACLED | Conflict | Daily batch (48h backfill) | `field_reported` | Yes — ACLED |
+| FIRMS NASA | Wildfire | Every 1 hour | `sensor` | Yes — NASA FIRMS |
+| USGS | Earthquake | Every 3 minutes | `sensor` | No — public feed |
+| OpenSky (military relay) | Military Flights | Every 1 minute | `sensor` | Yes — OpenSky |
+| AISStream | AIS Vessels | Real-time WebSocket | `sensor` | Yes — AISStream |
+
+## Data Source Pages
+
+<CardGroup cols={3}>
+  <Card title="GDELT Cloud v2" icon="newspaper" href="/data-sources/gdelt">
+    Media-derived conflict events from worldwide news, polled every 5 minutes across monitored conflict zones.
+  </Card>
+  <Card title="ACLED" icon="shield-halved" href="/data-sources/acled">
+    Field-reported, structured conflict events from the Armed Conflict Location and Event Data project.
+  </Card>
+  <Card title="FIRMS NASA" icon="fire" href="/data-sources/firms">
+    Satellite-detected wildfire and volcanic hotspots from NASA VIIRS and MODIS instruments.
+  </Card>
+  <Card title="USGS" icon="earth-americas" href="/data-sources/usgs">
+    Real-time earthquake feed from the US Geological Survey — no API key needed.
+  </Card>
+  <Card title="Military Flights" icon="plane" href="/data-sources/military-flights">
+    OpenSky ADS-B data filtered through a ~10,000-entry monthly ICAO24 hex database.
+  </Card>
+  <Card title="AIS Vessels" icon="ship" href="/data-sources/ais-vessels">
+    Real-time vessel positions from AISStream WebSocket, served per AOI bounding box.
+  </Card>
+</CardGroup>
+
+## Independence Classes
+
+GeoSentinel assigns every source an **independence class** that controls how much weight its events contribute to the confidence score of an incident. The three classes reflect how independently the source generates its data:
+
+### `sensor` — Confidence weight ×2.0
+
+Sources in this class capture physical-world signals directly: seismographs, satellite infrared sensors, and ADS-B / AIS transponders. There is no editorial intermediary. USGS, FIRMS, OpenSky, and AISStream are all `sensor` class. When two `sensor` sources independently detect the same event — say, USGS recording a magnitude 6.2 earthquake and FIRMS detecting fires in the same region — the confidence compound steeply because the observations are genuinely independent.
+
+### `field_reported` — Confidence weight ×1.5
+
+ACLED falls here. Data is compiled by researchers who verify events against multiple primary sources before publication. It is not a direct sensor feed, but it is also not a press article. Field-reported data has meaningful independence from media narratives, and the structured schema (fatality counts, geo-precision codes, actor names) enables precise normalization.
+
+### `media_derived` — Confidence weight ×0.5
+
+GDELT is the sole `media_derived` source currently active. This class is penalized because two media-derived reports **frequently cite the same original article** — appearing as two independent sources while actually sharing a single underlying observation. A second GDELT event about an airstrike in Kyiv does not double the evidential weight; it may simply be a second newspaper republishing the same wire story. The ×0.5 factor prevents media echo chambers from inflating incident confidence. To partially compensate, GDELT events detected with `has_fatalities=true` are given a higher base confidence by the mapper (`min(10, abs(goldstein_scale) + 5)`).
+
+<Note>
+The independence class multiplier applies **within the confidence aggregation window** (6 hours). Events from `media_derived` sources that arrive more than 6 hours apart are treated as independent observations for confidence purposes, but the base multiplier still applies.
+</Note>
+
+## Running Ingestors Manually
+
+Each ingestor has a corresponding script in `backend/scripts/`. Run them from the project root after setting up your `.env` file:
+
+```bash
+# USGS — no API key required
+cd backend
+uv run python backend/scripts/run_usgs.py
+
+# FIRMS — requires FIRMS_MAP_KEY
+cd backend
+uv run python backend/scripts/run_firms.py
+
+# GDELT — requires GDELT_API_KEY
+cd backend
+uv run python backend/scripts/run_gdelt.py
+
+# ACLED — requires ACLED_USERNAME and ACLED_PASSWORD
+cd backend
+uv run python backend/scripts/run_acled.py
+```
+
+<Tip>
+After running any ingestor, run the clustering job to fold new events into incidents:
+
+```bash
+cd backend
+uv run python backend/scripts/run_clustering.py
+```
+</Tip>
+
+<Warning>
+ACLED enforces a CC BY-NC 4.0 license — non-commercial use only. OpenSky Network data is subject to the OpenSky Terms of Use (non-commercial permitted). Review these terms before deploying GeoSentinel in a commercial context.
+</Warning>

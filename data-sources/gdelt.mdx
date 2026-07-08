@@ -1,0 +1,174 @@
+---
+title: "GDELT Cloud v2 Conflict Events Ingestion"
+sidebarTitle: "GDELT"
+description: "How GeoSentinel ingests GDELT Cloud v2 conflict events: polling interval, CAMEO code mapping, deduplication by globalEventId, and the Bearer token auth."
+---
+
+GeoSentinel pulls conflict events from the **GDELT Cloud v2 API** every five minutes, querying the `events` endpoint for fatal conflict events across a curated list of active conflict zones. GDELT (Global Database of Events, Language, and Tone) is the world's largest open-access database of human society events, constructed by monitoring worldwide news media in over 100 languages. The v2 Cloud API is a structured, normalized surface on top of this data — exposing typed `Event` objects with Goldstein scale scores, geo-coordinates, fatality flags, actor metadata, and linked articles, rather than the raw CAMEO tuples of classic GDELT.
+
+## What GDELT Is
+
+GDELT Cloud v2 monitors a global stream of broadcast, print, and web news and extracts structured conflict events in near-real time. Each event includes:
+
+- A stable `id` (the `globalEventId` used for deduplication)
+- A geographic location (`geo.lat` / `geo.lon`) derived from the article text
+- A `category` and `subcategory` drawn from the CAMEO taxonomy
+- A `metrics` block containing the **Goldstein scale** (−10 to +10, where negative = destabilizing)
+- A `has_fatalities` flag and fatality count
+- Up to three `top_articles` as evidence
+
+<Note>
+GeoSentinel uses GDELT Cloud v2 exclusively — not the legacy GDELT Project API. The v2 API does **not** expose legacy fields such as `SQLDATE`, `CAMEO_EventCode`, `Actor1Code`, or `QuadClass`. GeoSentinel's mapper reads `category`, `subcategory`, `metrics.goldstein_scale`, and `geo`, not any classic CAMEO fields.
+</Note>
+
+## API Details
+
+| Property | Value |
+|---|---|
+| Base URL | `https://gdeltcloud.com/api/v2` |
+| Auth | `Authorization: Bearer <GDELT_API_KEY>` |
+| Events endpoint | `GET /api/v2/events` |
+| Polling interval | Every **300 seconds** (5 minutes) |
+| Max date window | 29 days (a `DATE_WINDOW_TOO_LARGE` error is returned at 30+) |
+| Rate limit | 100 calls/month (resets on the 1st of each month) |
+
+To obtain a key, register at [https://gdeltcloud.com/dashboard](https://gdeltcloud.com/dashboard).
+
+## Conflict Zones Monitored
+
+The ingestor cycles through 12 conflict zones in `run_all_zones()`, fetching up to 100 events per zone with `has_fatalities=true`:
+
+```python
+CONFLICT_ZONES = [
+    "Ukraine", "Israel", "Palestine", "Gaza",
+    "Syria", "Yemen", "Sudan",
+    "Mali", "Burkina Faso", "Niger",
+    "Colombia", "Myanmar",
+]
+```
+
+Each zone is queried independently with a configurable lookback window (default: 1 day). A global 240-second timeout (`SIGALRM`) prevents a single slow zone from blocking the entire poll cycle.
+
+## Request Parameters
+
+The ingestor always applies `event_family=conflict` and `has_fatalities=true` to filter for significant events only. The full parameter set built by `_build_params()`:
+
+```python
+params = {
+    "date_start":    "YYYY-MM-DD",      # start of lookback window
+    "date_end":      "YYYY-MM-DD",      # now (UTC)
+    "event_family":  "conflict",
+    "sort":          "recent",
+    "limit":         100,               # per-zone cap
+    "country":       "<zone>",          # e.g. "Ukraine"
+    "has_fatalities": "true",
+}
+```
+
+## Category Mapping
+
+The mapper in `gdelt_mapper.py` translates GDELT Cloud categories and subcategories to GeoSentinel's internal event types in priority order: subcategory first → category → article title keywords (conservative, word-boundary-anchored patterns only).
+
+### Category map (`GDELT_CATEGORY_MAP`)
+
+| GDELT `category` | Internal `event_type` |
+|---|---|
+| `PROTESTS` | `social_protest` |
+| `RIOTS` | `social_riot` |
+| `BATTLES` | `conflict_battle` |
+| `EXPLOSIONS` | `conflict_explosion` |
+| `CRIMINAL_VIOLENCE` | `conflict_criminal` |
+| `TERRORISM` | `conflict_terror` |
+| `UNKNOWN` | `conflict_unknown` |
+
+### Subcategory map (`GDELT_SUBCATEGORY_MAP`)
+
+| GDELT `subcategory` | Internal `event_type` |
+|---|---|
+| `ARMED_CONFLICT` | `conflict_battle` |
+| `BOMBINGS` | `conflict_explosion` |
+| `SHELLING` | `conflict_battle` |
+| `PROTESTS` | `social_protest` |
+| `RIOTS` | `social_riot` |
+| `CIVILIAN_VIOLENCE` | `conflict_atrocity` |
+
+### Title keyword fallback
+
+If neither `category` nor `subcategory` produce a match, the mapper scans the article title for unambiguous phrases (with `\b` word boundaries to prevent false positives like "battle against drought"):
+
+```python
+_TITLE_KEYWORDS = [
+    (["drone strike", "airstrike", "air strike", "missile strike", "bombing raid"], "conflict_airstrike"),
+    (["suicide bomb", "car bomb", "roadside bomb", "ied", "improvised explosive", "detonation"], "conflict_explosion"),
+    (["assassination", "massacre", "execution", "ethnic cleansing"], "conflict_atrocity"),
+    (["terrorist attack", "terrorism", "jihadist", "extremist attack"], "conflict_terror"),
+    (["armed clash", "armed conflict", "gunfight", "firefight", "armed battle"], "conflict_battle"),
+    (["mass protest", "mass demonstration"], "social_protest"),
+]
+```
+
+## Severity Mapping
+
+Severity (0–10 scale) is derived from the **Goldstein scale** using the following table, where increasingly negative Goldstein scores (destabilizing events) map to higher severity:
+
+| Goldstein range | Severity |
+|---|---|
+| < −8.0 | 10.0 |
+| −8.0 to −6.0 | 8.5 |
+| −6.0 to −4.0 | 6.5 |
+| −4.0 to −2.0 | 4.5 |
+| −2.0 to 0.0 | 2.5 |
+| ≥ 0.0 | 1.0 |
+
+## Confidence Calculation
+
+```python
+confidence = min(10.0, abs(goldstein_scale) + 5.0)
+```
+
+A Goldstein score of −7.5 (heavy armed conflict) yields a confidence of `min(10, 7.5 + 5) = 10.0`. Events without a Goldstein score default to `5.0`.
+
+## Deduplication
+
+Events are deduplicated by the GDELT Cloud v2 stable event identifier, stored as `event_id_source`:
+
+```python
+event_id_source = str(event.get("id", ""))  # e.g. "gdelt_ev_abc123"
+```
+
+The pipeline upserts on `(source="gdelt", event_id_source)` — re-ingesting the same event updates `ingest_time` but does not create a duplicate.
+
+## Independence Class
+
+GDELT is classified as **`media_derived`** — the lowest independence class, carrying a **×0.5 confidence weight** during incident aggregation. Two GDELT reports about the same event often cite the same underlying news wire. See [Independence Classes](/data-sources/overview#independence-classes) for the full explanation.
+
+## Retry and Backoff
+
+The ingestor uses exponential backoff with a base of 2 and a cap of 120 seconds, up to 5 retries. HTTP 429 responses honor the `Retry-After` header. The `requests.Session` is pre-configured with `urllib3.util.retry.Retry` for transient 5xx errors:
+
+```python
+status_forcelist = [429, 500, 502, 503, 504]
+backoff_factor = 1
+total = 5  # DEFAULT_MAX_RETRIES
+```
+
+## Environment Variable
+
+```bash
+GDELT_API_KEY=gdelt_sk_...   # Bearer token from gdeltcloud.com/dashboard
+```
+
+## Running the Ingestor
+
+```bash
+cd backend
+uv run python backend/scripts/run_gdelt.py
+```
+
+<Tip>
+The script fetches events across all 12 conflict zones sequentially. For a targeted single-zone fetch, instantiate `GDELTCloudIngestor` directly and call `fetch_events()` with an explicit `country` parameter.
+</Tip>
+
+<Warning>
+GDELT Cloud v2 enforces a **100 calls/month** limit that resets on the 1st of each month. The `run_all_zones()` method makes one request per zone per run (12 requests). At a 5-minute polling interval, this exhausts the monthly quota in approximately 8 hours of continuous operation. Tune `lookback_days` and the polling schedule to stay within the limit.
+</Warning>

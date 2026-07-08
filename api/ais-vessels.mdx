@@ -1,0 +1,140 @@
+---
+title: "AIS Vessels API: Real-Time Ship Tracking"
+sidebarTitle: "AIS Vessels"
+description: "GET /v1/ais-vessels returns vessel positions from AISStream within active AOI bounding boxes, querying the AIS relay microservice on port 8003 in parallel."
+---
+
+The AIS Vessels endpoint retrieves real-time ship positions from the **ais-relay** microservice (port 8003), which maintains a persistent WebSocket connection to [AISStream.io](https://aisstream.io) and caches the latest vessel state in memory. Unlike the military flights endpoint, which issues a single union-bbox request, the backend queries the relay **once per active AOI** in parallel using a `ThreadPoolExecutor` with up to 8 worker threads, then deduplicates the combined result by vessel `id` — keeping the first occurrence when the same vessel falls inside multiple overlapping AOIs. Staleness is determined per AOI: if any individual relay call returns an `X-Stale: true` response header (set when the relay's WebSocket is disconnected and it is serving mock data), the top-level `isStale` flag is set to `true` for the entire response.
+
+## `GET /v1/ais-vessels`
+
+Returns all AIS-tracked vessels currently present within any active Area of Interest bounding box. No query parameters are accepted — bounding box coordinates are derived automatically from the active AOI records in the database.
+
+### Response body
+
+The response conforms to `AISVesselsResponseDTO`.
+
+<ResponseField name="vessels" type="array" required>
+  Deduplicated list of vessels observed within any active AOI. Each element is an `AISVesselDTO` object.
+
+  <Expandable title="AISVesselDTO fields">
+    <ResponseField name="id" type="string" required>
+      Unique vessel identifier, formatted as `mmsi:timestamp_unix` (e.g. `mmsi:123456789:1736942400`).
+    </ResponseField>
+
+    <ResponseField name="mmsi" type="string" required>
+      Maritime Mobile Service Identity — the 9-digit ITU vessel identifier (e.g. `123456789`).
+    </ResponseField>
+
+    <ResponseField name="name" type="string | null">
+      Vessel name as broadcast in AIS messages (e.g. `MSC OSCAR`). `null` when not set by the vessel's transponder.
+    </ResponseField>
+
+    <ResponseField name="callsign" type="string | null">
+      ITU radio callsign of the vessel (e.g. `V7ABC1`). `null` when not available.
+    </ResponseField>
+
+    <ResponseField name="location" type="object" required>
+      Current geographic position of the vessel.
+
+      <Expandable title="location fields">
+        <ResponseField name="latitude" type="float" required>
+          WGS-84 latitude in decimal degrees.
+        </ResponseField>
+        <ResponseField name="longitude" type="float" required>
+          WGS-84 longitude in decimal degrees.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+
+    <ResponseField name="sog" type="float" required>
+      Speed over ground in knots, as reported in the AIS message (≥ 0).
+    </ResponseField>
+
+    <ResponseField name="cog" type="float" required>
+      Course over ground in degrees (0–360), as reported in the AIS message.
+    </ResponseField>
+
+    <ResponseField name="heading" type="float" required>
+      True heading in degrees (0–360), as reported by the vessel's gyrocompass in the AIS message.
+    </ResponseField>
+
+    <ResponseField name="navigationalStatus" type="string" required>
+      AIS navigational status string (e.g. `"Under way using engine"`, `"At anchor"`, `"underway"`). The exact value depends on what the relay parsed from the AISStream message.
+    </ResponseField>
+
+    <ResponseField name="vesselType" type="string | null">
+      Vessel type category string (e.g. `"military_ops"`, `"cargo"`, `"tanker"`). `null` when not available.
+    </ResponseField>
+
+    <ResponseField name="flag" type="string | null">
+      ISO 3166-1 alpha-2 country flag code of the vessel's registration (e.g. `"US"`, `"GB"`). `null` when not available.
+    </ResponseField>
+
+    <ResponseField name="destination" type="string | null">
+      Destination port as entered by the crew in the AIS voyage data (e.g. `"ROTTERDAM"`). `null` when not broadcast.
+    </ResponseField>
+
+    <ResponseField name="isDark" type="boolean" required>
+      `true` if the vessel has ceased AIS transmissions — a "dark ship" event that may indicate deliberate signal suppression.
+    </ResponseField>
+
+    <ResponseField name="lastAisUpdate" type="string" required>
+      ISO 8601 UTC timestamp of the most recent AIS message processed by the relay (e.g. `2025-01-15T12:00:00Z`).
+    </ResponseField>
+
+    <ResponseField name="source" type="string" required>
+      Data source identifier. `"aisstream"` when the relay's WebSocket is connected to AISStream.io; `"mock"` when the relay is operating in fallback mode without a valid API key or active connection.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="clusters" type="array" required>
+  Reserved for future vessel clustering. Currently always returned as an empty array `[]`.
+</ResponseField>
+
+<ResponseField name="isStale" type="boolean" required>
+  `true` if any individual AOI relay call returned an `X-Stale: true` response header, meaning that at least one AOI's vessel data was served from mock or cached state rather than a live AISStream feed.
+</ResponseField>
+
+### Example request
+
+```bash
+curl http://localhost:8000/v1/ais-vessels
+```
+
+### Example response
+
+```json
+{
+  "vessels": [
+    {
+      "id": "mmsi:123456789",
+      "mmsi": "123456789",
+      "name": "MSC OSCAR",
+      "callsign": "V7ABC1",
+      "location": {"latitude": 36.1, "longitude": -5.3},
+      "sog": 12.4,
+      "cog": 180.0,
+      "heading": 178.0,
+      "navigationalStatus": "Under way using engine",
+      "vesselType": "cargo",
+      "flag": "PA",
+      "destination": "ROTTERDAM",
+      "isDark": false,
+      "lastAisUpdate": "2025-01-15T12:00:00Z",
+      "source": "aisstream"
+    }
+  ],
+  "clusters": [],
+  "isStale": false
+}
+```
+
+<Note>
+  If no AOIs are marked active in the database, the backend skips all relay calls and returns an empty `AISVesselsResponseDTO` — `vessels` and `clusters` will both be empty arrays and `isStale` will be `false`.
+</Note>
+
+<Note>
+  The `isStale` flag is set to `true` if **any** AOI's relay query returned an `X-Stale: true` response header. The relay sets this header when its AISStream WebSocket connection is not active and it is falling back to mock vessel data. Stale responses should be surfaced to users with an appropriate visual indicator. The relay requires the `AISSTREAM_API_KEY` environment variable to establish a live connection; without it, all responses will be stale mock data.
+</Note>

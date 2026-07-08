@@ -1,0 +1,251 @@
+---
+title: "Local Development Setup for GeoSentinel"
+sidebarTitle: "Local Setup"
+description: "Set up a full GeoSentinel development environment with PostgreSQL, the FastAPI backend, React frontend, and optional military and AIS relay microservices."
+---
+
+GeoSentinel's local development environment runs PostgreSQL 16 + PostGIS 3.4 in Docker while the FastAPI backend and React frontend run directly on your machine — giving you fast reloads without rebuilding containers on every change. The backend is managed with `uv` for deterministic dependency resolution, and the frontend uses Vite for sub-second HMR. Two optional relay microservices (military flights and AIS vessel tracking) can be started independently when you need to test those data layers.
+
+## Prerequisites
+
+Before you begin, make sure the following are installed and available on your `PATH`:
+
+- **Python 3.12+** — managed with `uv` (see below)
+- **Node.js 18+** — for the React frontend (`node --version`)
+- **Docker + Docker Compose v2** — for the PostgreSQL/PostGIS container (`docker compose version`)
+- **`uv` package manager** — install once with:
+  ```bash
+  pip install uv
+  ```
+- **API keys** for the external data sources you want to enable:
+  | Source | Purpose | Registration |
+  |--------|---------|--------------|
+  | GDELT Cloud v2 | Conflict events | https://gdeltcloud.com/dashboard |
+  | ACLED | Structured conflict data | https://acleddata.com/myacled |
+  | FIRMS (NASA) | Active wildfire hotspots | https://firms.modaps.eosdis.nasa.gov/api/map_key/ |
+  | Mapbox | Frontend map rendering | https://console.mapbox.com/ |
+  | OpenSky Network | Military flight relay *(optional)* | https://opensky-network.org/my-opensky/account |
+  | AISStream | AIS vessel relay *(optional)* | https://aisstream.io |
+
+## Step-by-Step Setup
+
+<Steps>
+
+  <Step title="Start PostgreSQL 16 + PostGIS 3.4">
+    From the project root, spin up the database container defined in `docker-compose.yml`:
+
+    ```bash
+    docker compose up -d
+    ```
+
+    The compose file uses the official `postgis/postgis:16-3.4` image and configures a healthcheck that polls `pg_isready -U postgres` every 5 seconds (5 retries, 5-second timeout). The database will be available on `localhost:5432` once the healthcheck passes. You can confirm it is ready with:
+
+    ```bash
+    docker compose ps
+    # STATUS should show "healthy" for the postgres service
+    ```
+
+    Data is persisted in a named Docker volume (`postgres_data`) so it survives container restarts.
+  </Step>
+
+  <Step title="Install Python dependencies">
+    `uv sync` reads `backend/pyproject.toml` and installs an exact, locked environment into the `backend/.venv` virtualenv:
+
+    ```bash
+    cd backend
+    uv sync
+    ```
+
+    You do not need to activate the virtualenv manually — all subsequent `uv run` commands target it automatically.
+  </Step>
+
+  <Step title="Install frontend dependencies">
+    ```bash
+    cd frontend
+    npm install
+    ```
+
+    This installs the React, Vite, Mapbox GL JS, and TanStack Query packages listed in `frontend/package.json`.
+  </Step>
+
+  <Step title="Create the .env file">
+    Create a `.env` file at the **project root** (the same directory as `docker-compose.yml`). The ingestors and API both load this file automatically at startup.
+
+    ```env
+    DATABASE_URL=postgresql://postgres:postgres@localhost:5432/geosentinel
+    FIRMS_MAP_KEY=your_firms_api_key
+    GDELT_API_KEY=your_gdelt_api_key
+    ACLED_USERNAME=your_acled_email
+    ACLED_PASSWORD=your_acled_password
+    AISSTREAM_API_KEY=your_aisstream_api_key
+    OPENSKY_CLIENT_ID=your_opensky_client_id
+    OPENSKY_CLIENT_SECRET=your_opensky_client_secret
+    MILITARY_SOURCE=opensky
+    MILITARY_RELAY_URL=http://localhost:8002
+    VITE_MAPBOX_TOKEN=your_mapbox_token
+    ```
+
+    <Warning>
+      Never commit `.env` to version control. It is already listed in `.gitignore`. See the [Environment Variables reference](/deployment/environment-variables) for a description of every key.
+    </Warning>
+  </Step>
+
+  <Step title="Run database migrations">
+    Apply all Alembic migrations to create the full schema (`events_canonical`, `incidents`, `aoi`, `corrections_audit`, `events_quarantine`, `sources_metadata`):
+
+    ```bash
+    cd backend
+    uv run alembic upgrade head
+    ```
+
+    Alembic reads `backend/alembic.ini`, which sets `script_location` to `backend/alembic` and prepends `backend` to `sys.path`. Re-running this command is safe — Alembic is idempotent and will skip already-applied revisions.
+  </Step>
+
+  <Step title="Start the FastAPI backend">
+    Open a dedicated terminal and run Uvicorn in reload mode so the server restarts on every source change:
+
+    ```bash
+    cd backend
+    uv run uvicorn backend.api.main:app --reload --host 0.0.0.0 --port 8000
+    ```
+
+    The API will be available at `http://localhost:8000`.
+  </Step>
+
+  <Step title="Start the React frontend">
+    Open a second terminal and start the Vite dev server:
+
+    ```bash
+    cd frontend
+    npm run dev
+    ```
+
+    The frontend will be available at `http://localhost:5173` with hot module replacement enabled.
+  </Step>
+
+  <Step title="Verify everything is running">
+    Confirm the backend is healthy:
+
+    ```bash
+    curl http://localhost:8000/v1/health
+    ```
+
+    Expected response:
+
+    ```json
+    {"status": "healthy"}
+    ```
+
+    You can also check the database connection specifically:
+
+    ```bash
+    curl http://localhost:8000/v1/health/db
+    ```
+
+    Then open `http://localhost:5173` in your browser — you should see the GeoSentinel dashboard with an empty Mapbox map.
+  </Step>
+
+</Steps>
+
+## Optional: Military Relay
+
+The military flight relay is a separate FastAPI microservice that connects to the OpenSky Network API, filters for military aircraft using a monthly ICAO24 hex database (~10,000 entries), and exposes them on port 8002. It is only needed when testing the `GET /v1/military-flights` endpoint or the Mapbox military layer in the frontend.
+
+**PowerShell (Windows):**
+
+```powershell
+$env:PYTHONPATH = "C:\path\to\GeoSentinel"
+$env:MILITARY_SOURCE = "opensky"
+$env:OPENSKY_CLIENT_ID = "your_client_id"
+$env:OPENSKY_CLIENT_SECRET = "your_client_secret"
+python -m services.military_relay.main
+```
+
+**Bash (Linux / macOS):**
+
+```bash
+export PYTHONPATH=$(pwd)
+export MILITARY_SOURCE=opensky
+export OPENSKY_CLIENT_ID=your_client_id
+export OPENSKY_CLIENT_SECRET=your_client_secret
+python -m services.military_relay.main
+```
+
+The relay listens on `http://localhost:8002`. At startup it checks `data/military_hex.txt` and **automatically downloads the latest monthly OpenSky aircraft database** (~108 MB from S3) if the file does not exist, is older than 30 days, or contains fewer than 1,000 entries. This background download does not block the relay from starting. A `/debug` endpoint is available at `http://localhost:8002/debug` for diagnosing filter coverage.
+
+<Tip>
+  To force an immediate refresh of the military hex database without restarting the relay, run:
+
+  ```bash
+  python -m services.military_relay.update_military_db
+  ```
+</Tip>
+
+## Optional: AIS Relay
+
+The AIS relay microservice subscribes to the [AISStream](https://aisstream.io) WebSocket feed and exposes real-time vessel positions on port 8003. It falls back to a mock data generator automatically when `AISSTREAM_API_KEY` is missing or the WebSocket connection drops.
+
+```bash
+export PYTHONPATH=$(pwd)
+export AISSTREAM_API_KEY=your_aisstream_api_key
+python -m services.ais_relay.main
+```
+
+The relay will be reachable at `http://localhost:8003`. The frontend polls this relay for vessel data displayed in the AIS map layer.
+
+## Seeding Test Data
+
+To quickly populate the database with three representative incidents (a conflict event, an earthquake, and a wildfire) along with the `sources_metadata` entries for all configured ingestors, call the seed endpoint:
+
+```bash
+curl http://localhost:8000/v1/seed
+```
+
+This is idempotent — running it multiple times will upsert rather than duplicate the seed records.
+
+## Running Ingestors
+
+Each ingestor is a standalone Python script that loads `.env` from the project root automatically. Run them from the **project root** (not from inside `backend/`):
+
+| Ingestor | Command | Notes |
+|----------|---------|-------|
+| USGS Earthquakes | `uv run python backend/scripts/run_usgs.py` | Pulls last 24 h, `minmagnitude=4.0`, polling every 3 min |
+| FIRMS Wildfires | `uv run python backend/scripts/run_firms.py` | Requires `FIRMS_MAP_KEY`; filters by active AOI bounding boxes |
+| GDELT Conflicts | `uv run python backend/scripts/run_gdelt.py` | Requires `GDELT_API_KEY`; 5-min window via GDELT Cloud v2 |
+| ACLED Conflicts | `uv run python backend/scripts/run_acled.py` | Requires `ACLED_USERNAME` + `ACLED_PASSWORD`; backfills 48 h |
+| Clustering | `uv run python backend/scripts/run_clustering.py` | DBSCAN spatio-temporal clustering; run after any ingestor |
+
+<Note>
+  Always run the **clustering job** after ingesting new events. The clustering step is what groups raw `events_canonical` rows into the `incidents` that the API and frontend display.
+</Note>
+
+## Running Tests
+
+Tests live in the `tests/` directory at the project root. Run them from inside `backend/` so that `uv` picks up the correct virtual environment:
+
+```bash
+cd backend
+
+# Run all tests
+uv run pytest
+
+# Run with line-level coverage report
+uv run pytest --cov=backend --cov-report=term-missing
+
+# Run only normalizer tests
+uv run pytest ../tests/normalizers/
+
+# Run only clustering/lifecycle tests
+uv run pytest ../tests/jobs/
+```
+
+## Service URLs
+
+| Service | URL | Notes |
+|---------|-----|-------|
+| FastAPI REST API | http://localhost:8000 | Main backend |
+| Swagger UI | http://localhost:8000/docs | Interactive API explorer |
+| ReDoc | http://localhost:8000/redoc | OpenAPI schema browser |
+| React Frontend | http://localhost:5173 | Vite dev server with HMR |
+| Military Relay | http://localhost:8002 | Optional; requires OpenSky credentials |
+| AIS Relay | http://localhost:8003 | Optional; requires AISStream API key |

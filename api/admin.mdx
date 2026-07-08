@@ -1,0 +1,217 @@
+---
+title: "Admin Jobs API: Trigger and Monitor Data Ingestion"
+sidebarTitle: "Admin"
+description: "Async job management API for triggering GeoSentinel ingestors and lifecycle jobs. POST to start jobs, GET to poll status. Prevents duplicate concurrent runs."
+---
+
+The Admin API provides endpoints for triggering GeoSentinel's data ingestion scripts and incident lifecycle maintenance as non-blocking background tasks. Each POST endpoint immediately returns a `202 Accepted` response containing a `job_id` UUID, which you can then poll with the status endpoint until the job reaches `completed` or `failed`. All job state is tracked in a shared in-memory `JOBS` dictionary protected by an `asyncio.Lock`, and the API refuses to start a second instance of the same job while one is already running — returning `409 Conflict` with the ID of the existing job instead.
+
+---
+
+## `POST /v1/admin/run/{source}` — Run a Single Ingestor
+
+Launches one of the five data ingestor scripts as a background subprocess. The `source` path parameter determines which script is executed.
+
+<ParamField path="source" type="string" required>
+  The ingestor to run. Must be one of:
+
+  | Value | Script | Description |
+  |---|---|---|
+  | `usgs` | `run_usgs.py` | USGS earthquake feed ingestion |
+  | `firms` | `run_firms.py` | NASA FIRMS active fire ingestion |
+  | `gdelt` | `run_gdelt.py` | GDELT conflict event ingestion |
+  | `acled` | `run_acled.py` | ACLED armed conflict event ingestion |
+  | `clustering` | `run_clustering.py` | Spatial incident clustering |
+</ParamField>
+
+Returns **202 Accepted** with a `JobResponse` on success. Returns **400 Bad Request** if `source` is not one of the valid values above. Returns **409 Conflict** if a job with the same `source` name is already running.
+
+```bash
+# Trigger USGS earthquake ingestion
+curl -X POST http://localhost:8000/v1/admin/run/usgs
+
+# Trigger clustering
+curl -X POST http://localhost:8000/v1/admin/run/clustering
+```
+
+---
+
+## `POST /v1/admin/run/lifecycle` — Run Lifecycle Job
+
+Triggers the incident lifecycle maintenance job, which marks stale incidents and resets incidents from `updated` status back to `open`. This job runs in-process (not as a subprocess) against the PostgreSQL database directly.
+
+Returns **202 Accepted** with a `JobResponse`. Returns **409 Conflict** if the lifecycle job is already running.
+
+```bash
+curl -X POST http://localhost:8000/v1/admin/run/lifecycle
+```
+
+---
+
+## `POST /v1/admin/run/all` — Run All Jobs
+
+Runs a full pipeline as a single orchestrated background task: all four ingestors (`usgs`, `firms`, `gdelt`, `acled`) are executed **in parallel** using `asyncio.gather`, followed sequentially by the clustering job, and then the lifecycle job. The aggregated metrics from all stages are summed and stored in the job result.
+
+Returns **202 Accepted** with a `JobResponse`. Returns **409 Conflict** if an `all` job is already running. Individual ingestor failures within the pipeline are captured per-source in the `result.details` object and do not abort the remaining stages.
+
+```bash
+curl -X POST http://localhost:8000/v1/admin/run/all
+```
+
+---
+
+## `GET /v1/admin/run/status/{job_id}` — Poll Job Status
+
+Retrieves the current state of a previously submitted job by its UUID.
+
+<ParamField path="job_id" type="string" required>
+  The UUID returned in the `job_id` field of the `JobResponse` from any POST endpoint.
+</ParamField>
+
+Returns **200 OK** with a `JobStatusResponse`. Returns **404 Not Found** if no job with the given ID exists in the current server session.
+
+---
+
+### Response schemas
+
+#### `JobResponse` — 202 from all POST endpoints
+
+<ResponseField name="job" type="string" required>
+  The name of the job that was started (e.g. `"usgs"`, `"lifecycle"`, `"all"`).
+</ResponseField>
+
+<ResponseField name="status" type="string" required>
+  Always `"running"` in the immediate 202 response.
+</ResponseField>
+
+<ResponseField name="started_at" type="string" required>
+  ISO 8601 UTC timestamp of when the job was registered (e.g. `"2025-01-15T12:00:00+00:00"`).
+</ResponseField>
+
+<ResponseField name="job_id" type="string" required>
+  UUID v4 string to use when polling `GET /v1/admin/run/status/{job_id}`.
+</ResponseField>
+
+#### `JobStatusResponse` — 200 from GET status endpoint
+
+<ResponseField name="job_id" type="string" required>
+  The UUID of this job record.
+</ResponseField>
+
+<ResponseField name="job" type="string" required>
+  The name of the job (e.g. `"usgs"`, `"firms"`, `"clustering"`, `"lifecycle"`, `"all"`).
+</ResponseField>
+
+<ResponseField name="status" type="string" required>
+  Current state of the job. One of:
+  - `"running"` — the background task is still executing
+  - `"completed"` — the script exited with return code 0 and metrics were parsed
+  - `"failed"` — the script raised an exception or exited with a non-zero return code
+</ResponseField>
+
+<ResponseField name="started_at" type="string" required>
+  ISO 8601 UTC timestamp of when the job started.
+</ResponseField>
+
+<ResponseField name="finished_at" type="string | null">
+  ISO 8601 UTC timestamp of when the job completed or failed. `null` while still running.
+</ResponseField>
+
+<ResponseField name="duration_sec" type="integer | null">
+  Wall-clock duration of the job in whole seconds. `null` while still running.
+</ResponseField>
+
+<ResponseField name="result" type="object | null">
+  Parsed metrics from the job's stdout output once completed. `null` while running or if the job failed. Contains the following integer fields:
+
+  <Expandable title="result fields">
+    <ResponseField name="events_fetched" type="integer">
+      Total number of raw events retrieved from the upstream data source.
+    </ResponseField>
+    <ResponseField name="events_inserted" type="integer">
+      Number of events successfully written to the database.
+    </ResponseField>
+    <ResponseField name="events_quarantine" type="integer">
+      Number of events rejected and placed in quarantine during validation.
+    </ResponseField>
+    <ResponseField name="incidents_created" type="integer">
+      Number of new incidents created by the clustering or ingestor run.
+    </ResponseField>
+    <ResponseField name="incidents_updated" type="integer">
+      Number of existing incidents updated (including lifecycle transitions).
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="error" type="string | null">
+  Error message captured from the script's stderr or the Python exception message if `status` is `"failed"`. `null` otherwise.
+</ResponseField>
+
+---
+
+### Full polling example
+
+```bash
+# Start a USGS ingestion job and capture the job_id
+JOB_ID=$(curl -s -X POST http://localhost:8000/v1/admin/run/usgs | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
+
+# Poll until complete
+curl "http://localhost:8000/v1/admin/run/status/$JOB_ID"
+```
+
+Example completed status response:
+
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "job": "usgs",
+  "status": "completed",
+  "started_at": "2025-01-15T12:00:00+00:00",
+  "finished_at": "2025-01-15T12:00:45+00:00",
+  "duration_sec": 45,
+  "result": {
+    "events_fetched": 23,
+    "events_inserted": 18,
+    "events_quarantine": 0,
+    "incidents_created": 12,
+    "incidents_updated": 6
+  },
+  "error": null
+}
+```
+
+Example failed status response:
+
+```json
+{
+  "job_id": "660f9511-f30c-52e5-b827-557766551111",
+  "job": "gdelt",
+  "status": "failed",
+  "started_at": "2025-01-15T12:05:00+00:00",
+  "finished_at": "2025-01-15T12:05:03+00:00",
+  "duration_sec": 3,
+  "result": null,
+  "error": "ConnectionRefusedError: upstream GDELT endpoint unreachable"
+}
+```
+
+Example 409 Conflict response (job already running):
+
+```json
+{
+  "detail": {
+    "error": "job_already_running",
+    "job": "usgs",
+    "running_since": "2025-01-15T12:00:00+00:00",
+    "job_id": "550e8400-e29b-41d4-a716-446655440000"
+  }
+}
+```
+
+<Note>
+  All job state is stored in the server process's memory. If the GeoSentinel backend is restarted, all job history — including running, completed, and failed jobs — is permanently lost. Any `job_id` obtained before a restart will return **404 Not Found**.
+</Note>
+
+<Warning>
+  There is currently **no authentication** on any of the `/v1/admin/` endpoints. These routes must not be exposed on a public network interface in production until JWT-based access control is implemented. Restrict access at the network or reverse-proxy level until that work is complete.
+</Warning>

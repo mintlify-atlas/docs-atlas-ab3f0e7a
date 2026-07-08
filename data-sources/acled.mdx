@@ -1,0 +1,165 @@
+---
+title: "ACLED Conflict Data Ingestion and Normalization"
+sidebarTitle: "ACLED"
+description: "How GeoSentinel ingests ACLED conflict data: OAuth2 Bearer auth, 48-hour backfill, event_id deduplication, and category mapping from ACLED types."
+---
+
+GeoSentinel ingests conflict event data from **ACLED** (Armed Conflict Location and Event Data) on a daily batch schedule, pulling the most recent 48 hours of events and upserting them by stable event ID. ACLED is a disaggregated conflict data collection, analysis, and crisis mapping project that compiles structured, field-reported conflict events sourced from local and regional news, NGO reports, government communiqués, and field researchers. Unlike media-derived sources, ACLED events are individually reviewed and include precise actor names, geo-precision codes, fatality counts, and administrative region data — making it one of GeoSentinel's highest-confidence conflict data sources.
+
+<Note>
+ACLED data is licensed under **CC BY-NC 4.0** — non-commercial use only. Review the [ACLED Terms of Use](https://acleddata.com/terms-of-use/) before deploying GeoSentinel in a commercial context.
+</Note>
+
+## What ACLED Is
+
+ACLED covers political violence and protest events across Africa, the Middle East, Asia, Latin America, Europe, and North America. Each record includes:
+
+- A stable `data_id` identifier used for deduplication and upserts
+- A structured `event_type` drawn from ACLED's taxonomy (Battles, Protests, etc.)
+- Actor names (`actor1`, `actor2`) and interaction codes
+- Precise geographic coordinates with a `geo_precision` code (1–5)
+- A fatality count (`fatalities`, where `−1` means unknown)
+- Administrative location (`admin1`, `admin2`, `country`)
+- Source citation (`source`, `source_url`, `notes`)
+
+ACLED can **retroactively update** records — correcting fatality counts or reclassifying events after initial publication. GeoSentinel handles this with an upsert on `(source="acled", event_id_source)`, so corrections from ACLED flow through automatically on the next daily batch.
+
+## Authentication
+
+ACLED uses **OAuth2 Resource Owner Password Credentials** (password grant). The ingestor fetches a Bearer token automatically at startup using `ACLED_USERNAME` and `ACLED_PASSWORD`:
+
+```python
+data = {
+    "grant_type":  "password",
+    "client_id":   "acled",
+    "username":    self.username,
+    "password":    self.password,
+    "scope":       "authenticated",
+}
+response = session.post("https://acleddata.com/oauth/token", data=data)
+access_token = response.json()["access_token"]
+```
+
+All subsequent requests include `Authorization: Bearer <access_token>`. If a request returns HTTP 401, the ingestor automatically refreshes the token and retries once.
+
+To register for access, visit [https://acleddata.com/myacled](https://acleddata.com/myacled).
+
+## API Details
+
+| Property | Value |
+|---|---|
+| API endpoint | `https://acleddata.com/api/acled/read` |
+| Auth | OAuth2 Bearer (auto-obtained from `ACLED_TOKEN_URL`) |
+| Polling interval | Every **86 400 seconds** (24 hours / daily batch) |
+| Backfill window | **48 hours** from now — `event_date >= now - 48h` |
+| Page size | 500 events per page |
+| License | CC BY-NC 4.0 |
+
+## Fields Requested
+
+The ingestor requests a minimal field set to reduce payload size:
+
+```python
+"fields": (
+    "data_id|event_date|event_type|latitude|longitude|"
+    "fatalities|geo_precision|actor1|actor2|admin1|admin2|"
+    "country|notes|source|source_url"
+)
+```
+
+## Event Type Mapping
+
+The mapper in `acled_mapper.py` translates ACLED's `event_type` string to GeoSentinel's internal taxonomy:
+
+| ACLED `event_type` | Internal `event_type` |
+|---|---|
+| `Battles` | `conflict_battle` |
+| `Explosions/Remote violence` | `conflict_explosion` |
+| `Violence against civilians` | `conflict_civilian_violence` |
+| `Protests` | `social_protest` |
+| `Riots` | `social_riot` |
+| `Strategic developments` | `conflict_strategic` |
+
+Any ACLED event type not in this map is classified as `conflict_unknown`.
+
+All ACLED events are assigned `category = CategoryEnum.CONFLICT`, regardless of event type (including protests and riots, which could be argued as social events — the mapper follows the spec and keeps them under conflict).
+
+## Severity Mapping
+
+Severity (0–10) is derived from the **fatality count** using a stepped table:
+
+| Fatalities | Severity |
+|---|---|
+| 0 | 1.0 |
+| 1–5 | 3.0 |
+| 6–25 | 5.0 |
+| 26–100 | 7.0 |
+| 101–500 | 8.5 |
+| 501+ | 10.0 |
+
+A fatality value of `−1` (ACLED's code for "unknown count") is treated as `0` for severity calculation but is preserved as `−1` in `fatalities` — the validator explicitly permits this value.
+
+## Geo-Precision Mapping
+
+ACLED's `geo_precision` code maps to `location_accuracy_km`:
+
+| `geo_precision` | `location_accuracy_km` |
+|---|---|
+| 1 | 0.1 km (exact location) |
+| 2 | 5.0 km (nearby town) |
+| 3 | 25.0 km (admin region) |
+| 4 | 100.0 km (approximate region) |
+| 5 | 500.0 km (country-level only) |
+
+## Deduplication
+
+Events are deduplicated by ACLED's stable `data_id` field:
+
+```python
+event_id_source = str(event.get("data_id", ""))
+```
+
+Because ACLED updates existing records retroactively, the upsert on `(source, event_id_source)` ensures updated fatality counts and corrections reach the database without creating duplicate events.
+
+## Independence Class
+
+ACLED is classified as **`field_reported`** — carrying a **×1.5 confidence weight** during incident aggregation. Field-reported data is compiled by human researchers verifying events against multiple primary sources, giving it substantially higher evidential independence than media-derived sources. See [Independence Classes](/data-sources/overview#independence-classes).
+
+## Confidence Score
+
+All ACLED events are assigned a fixed confidence of `7.0` — reflecting the structured, verified nature of the data. ACLED does not publish per-event certainty scores, so the mapper uses a single credible baseline.
+
+## Retry and Backoff
+
+The ingestor uses exponential backoff (base 2, cap 120 seconds) with up to 5 retries per page. Pagination continues until a page returns fewer than `page_size` (500) events:
+
+```python
+while True:
+    page_events = self.fetch_page(since_date, page)
+    if not page_events:
+        break
+    all_events.extend(page_events)
+    if len(page_events) < self.page_size:
+        break
+    page += 1
+```
+
+## Environment Variables
+
+```bash
+ACLED_USERNAME=your_registered_email@example.com
+ACLED_PASSWORD=your_acled_password
+# Optional: skip OAuth2 round-trip if you already have a token
+ACLED_ACCESS_TOKEN=eyJ...
+```
+
+## Running the Ingestor
+
+```bash
+cd backend
+uv run python backend/scripts/run_acled.py
+```
+
+<Info>
+The ingestor fetches all events since `now - 48h` in paginated batches of 500. For a region with high event volume, this may require several pages. Total request count depends on event density — the ingestor stops paginating as soon as a partial page is received.
+</Info>

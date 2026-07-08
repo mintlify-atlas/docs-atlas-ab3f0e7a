@@ -1,0 +1,182 @@
+---
+title: "Military Flights API: Real-Time Aircraft Tracking"
+sidebarTitle: "Military Flights"
+description: "GET /v1/military-flights returns military aircraft positions within active AOI bounding boxes, proxied from the OpenSky relay microservice on port 8002."
+---
+
+The Military Flights endpoint does not query OpenSky directly. Instead, the GeoSentinel backend proxies the request to the **military-relay** microservice running on port 8002, which maintains its own rate limiter, bbox cache, and hex-database filter against the OpenSky Network ADS-B feed. The backend computes the union bounding box across all active AOIs in the database and issues a single request to the relay at `GET /api/military/v1/list-military-flights`, avoiding the serialization bottleneck that arises from sending one request per AOI. Results include per-flight trail history (up to the last 5 positions) assembled by the relay's in-memory `flight_history` store, and a staleness flag derived from the `X-Stale` response header the relay sets when it falls back to cached data.
+
+## `GET /v1/military-flights`
+
+Returns all military aircraft currently visible within the union bounding box of every active Area of Interest. No query parameters are accepted — bounding box coordinates are derived automatically from the active AOI records in the database.
+
+### Response body
+
+The response conforms to `MilitaryFlightsResponseDTO`.
+
+<ResponseField name="flights" type="array" required>
+  List of military aircraft currently tracked within the AOI union bounding box. Each element is a `MilitaryFlightDTO` object.
+
+  <Expandable title="MilitaryFlightDTO fields">
+    <ResponseField name="id" type="string" required>
+      Unique flight identifier, formatted as `hexCode:timestamp_unix` (e.g. `ae1234:1736942400`).
+    </ResponseField>
+
+    <ResponseField name="callsign" type="string" required>
+      ATC callsign broadcast by the aircraft (e.g. `RCH210`).
+    </ResponseField>
+
+    <ResponseField name="hexCode" type="string" required>
+      ICAO24 Mode-S hex transponder code, always uppercase (e.g. `AE1234`).
+    </ResponseField>
+
+    <ResponseField name="location" type="object" required>
+      Current geographic position of the aircraft.
+
+      <Expandable title="location fields">
+        <ResponseField name="latitude" type="float" required>
+          WGS-84 latitude in decimal degrees.
+        </ResponseField>
+        <ResponseField name="longitude" type="float" required>
+          WGS-84 longitude in decimal degrees.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+
+    <ResponseField name="altitude" type="integer" required>
+      Barometric altitude in feet.
+    </ResponseField>
+
+    <ResponseField name="heading" type="integer" required>
+      True track heading in degrees (0–360).
+    </ResponseField>
+
+    <ResponseField name="speed" type="integer" required>
+      Ground speed in knots.
+    </ResponseField>
+
+    <ResponseField name="lastSeenAt" type="string" required>
+      ISO 8601 UTC timestamp of the most recent ADS-B state received from OpenSky (e.g. `2025-01-15T12:00:00Z`).
+    </ResponseField>
+
+    <ResponseField name="aircraftType" type="string | null">
+      ICAO aircraft type designator (e.g. `B752`, `C17`). `null` when not available in the hex database.
+    </ResponseField>
+
+    <ResponseField name="aircraftModel" type="string | null">
+      Human-readable aircraft model name (e.g. `Boeing C-17 Globemaster III`). `null` when not available.
+    </ResponseField>
+
+    <ResponseField name="operator" type="string | null">
+      Registered operator name (e.g. `US Air Force`). `null` when not available.
+    </ResponseField>
+
+    <ResponseField name="operatorCountry" type="string | null">
+      Country of the registered operator (e.g. `United States`). `null` when not available.
+    </ResponseField>
+
+    <ResponseField name="registration" type="string | null">
+      Tail number / civil registration of the aircraft. `null` when not available.
+    </ResponseField>
+
+    <ResponseField name="origin" type="string | null">
+      ICAO code of the departure airport if known. `null` when not available.
+    </ResponseField>
+
+    <ResponseField name="destination" type="string | null">
+      ICAO code of the destination airport if known. `null` when not available.
+    </ResponseField>
+
+    <ResponseField name="isInteresting" type="boolean" required>
+      `true` if the relay's military filter has flagged this flight as particularly notable based on operator, type, or pattern matching.
+    </ResponseField>
+
+    <ResponseField name="trail" type="array | null">
+      Ordered list of up to 5 recent positions as `[longitude, latitude]` pairs, assembled by the relay's in-memory history store. `null` when no trail data is available yet.
+    </ResponseField>
+
+    <ResponseField name="source" type="string" required>
+      Data source identifier. Always `"opensky"` when the relay is operating normally.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="clusters" type="array" required>
+  Groups of 3 or more aircraft within 100 km of each other, computed by the relay using a haversine-distance pass over the current `flights` list. Each element is a `MilitaryFlightClusterDTO` object.
+
+  <Expandable title="MilitaryFlightClusterDTO fields">
+    <ResponseField name="center" type="object" required>
+      Geographic centroid of the cluster.
+
+      <Expandable title="center fields">
+        <ResponseField name="latitude" type="float" required>
+          Average latitude of all aircraft in the cluster.
+        </ResponseField>
+        <ResponseField name="longitude" type="float" required>
+          Average longitude of all aircraft in the cluster.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+
+    <ResponseField name="count" type="integer" required>
+      Number of aircraft in the cluster.
+    </ResponseField>
+
+    <ResponseField name="avgAltitude" type="integer" required>
+      Integer average altitude of the clustered aircraft, in feet.
+    </ResponseField>
+
+    <ResponseField name="avgSpeed" type="integer" required>
+      Integer average ground speed of the clustered aircraft, in knots.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="isStale" type="boolean" required>
+  `true` when the relay returned an `X-Stale: true` response header, indicating it served data from its bbox cache rather than a fresh OpenSky fetch. Clients should display stale data with a visual warning.
+</ResponseField>
+
+### Example request
+
+```bash
+curl http://localhost:8000/v1/military-flights
+```
+
+### Example response
+
+```json
+{
+  "flights": [
+    {
+      "id": "abc123:1736942400",
+      "callsign": "RCH210",
+      "hexCode": "AE1234",
+      "location": {"latitude": 48.5, "longitude": 2.3},
+      "altitude": 35000,
+      "heading": 270,
+      "speed": 480,
+      "lastSeenAt": "2025-01-15T12:00:00Z",
+      "aircraftType": "C17",
+      "aircraftModel": "Boeing C-17 Globemaster III",
+      "operator": "US Air Force",
+      "operatorCountry": "United States",
+      "registration": null,
+      "origin": null,
+      "destination": null,
+      "isInteresting": false,
+      "trail": [[2.1, 48.3], [2.2, 48.4], [2.3, 48.5]],
+      "source": "opensky"
+    }
+  ],
+  "clusters": [],
+  "isStale": false
+}
+```
+
+<Note>
+  If no AOIs are marked active in the database, the backend skips the relay call entirely and returns an empty `MilitaryFlightsResponseDTO` — `flights` and `clusters` will both be empty arrays and `isStale` will be `false`.
+</Note>
+
+<Note>
+  The military-relay microservice requires two environment variables to authenticate with the OpenSky Network API: `OPENSKY_CLIENT_ID` and `OPENSKY_CLIENT_SECRET`. Without valid credentials the relay will fail to fetch live state vectors. The relay runs as a separate process on port **8002**, and the backend resolves it via the `MILITARY_RELAY_URL` environment variable (default: `http://military-relay:8002`).
+</Note>

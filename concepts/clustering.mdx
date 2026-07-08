@@ -1,0 +1,196 @@
+---
+title: "Spatio-Temporal Event Clustering with DBSCAN"
+sidebarTitle: "Clustering"
+description: "How GeoSentinel's DBSCAN algorithm groups nearby concurrent events from multiple sources into single deduplicated incidents using a normalized distance metric."
+---
+
+After canonical events are validated and written to `events_canonical`, the clustering job groups them into incidents. Each row in `events_canonical` is a single observation from a single source. A real-world wildfire, battle, or earthquake is almost always reported by multiple sources simultaneously — a FIRMS satellite pass, an ACLED field report, and a GDELT media extraction may all describe the same fire within hours of each other. Without clustering, the API would expose three separate incidents where only one exists. The clustering job solves this by running a DBSCAN algorithm over unassigned events, using a normalized mixed distance metric that accounts for both geographic proximity and temporal overlap.
+
+---
+
+## The Problem
+
+Consider a wildfire burning near the Syrian–Turkish border. Within a six-hour window:
+
+- **FIRMS** detects a thermal hotspot at (36.82°N, 36.44°E) via MODIS satellite.
+- **GDELT** extracts a news article placing the same fire at (36.80°N, 36.46°E).
+- **ACLED** logs a related displacement event at (36.83°N, 36.43°E).
+
+All three events have `category = "wildfire"` and are within 4 km and 6 hours of each other. Without clustering, the API returns three separate incidents. With clustering, they collapse into one incident whose `canonical_point` is the confidence-weighted centroid of the three observations, `source_count = 3`, and `confidence` is boosted by the sensor observation (FIRMS has independence class `sensor`, weight ×2.0).
+
+The same pattern holds for conflict events (GDELT + ACLED + Liveuamap reporting the same battle), earthquakes (USGS primary + secondary network reports), and vessel interdictions (ADS-B + MarineTraffic tracking the same aircraft/ship).
+
+---
+
+## Distance Metric
+
+DBSCAN requires a pairwise distance function. Using raw kilometres and hours together produces an epsilon with no physical meaning — a 10 km gap and a 10-hour gap are not equivalent. GeoSentinel normalizes both dimensions to `[0, 1]` before combining them:
+
+```
+d(e1, e2) = w_space · (haversine_km(e1, e2) / KM_MAX)
+           + w_time  · (|e1.event_time - e2.event_time| / HOURS_MAX)
+```
+
+Where:
+- `haversine_km(e1, e2)` is the great-circle distance between the two event coordinates.
+- `KM_MAX` and `HOURS_MAX` are per-category reference scales that define what "far" means for that event type.
+- `w_space` and `w_time` are per-category weights that sum to 1.0.
+- `epsilon` is the DBSCAN neighborhood threshold in the normalized `[0, 1]` space.
+
+If `d(e1, e2) < epsilon`, the two events are considered neighbors and may be grouped into the same incident.
+
+The per-category parameters come from `backend/jobs/clustering_job.py`:
+
+| Category | `KM_MAX` | `HOURS_MAX` | `w_space` | `w_time` | `epsilon` |
+|---|---|---|---|---|---|
+| `conflict` | 50 km | 48 h | 0.6 | 0.4 | 0.15 |
+| `wildfire` | 20 km | 24 h | 0.7 | 0.3 | 0.20 |
+| `earthquake` | 100 km | 2 h | 0.5 | 0.5 | 0.10 |
+| `disaster_natural` | 75 km | 72 h | 0.5 | 0.5 | 0.15 |
+| `mobility` | 30 km | 6 h | 0.8 | 0.2 | 0.12 |
+| `thermal_anomaly` | 15 km | 12 h | 0.7 | 0.3 | 0.15 |
+
+<Note>
+  These parameters are calibrated starting points, not fixed constants. Earthquake clusters use a tight 2-hour temporal window (`HOURS_MAX=2`) because seismological networks report the same quake within minutes, but space is generous (100 km) to capture aftershock zones. Conflict clusters use a wider temporal window (48 h) but tighter space (50 km) because battles can persist over days at a fixed location.
+</Note>
+
+The implementation in `backend/jobs/clustering_job.py`:
+
+```python
+def compute_mixed_distance(
+    lat1: float, lon1: float, time1: datetime,
+    lat2: float, lon2: float, time2: datetime,
+    category: str,
+) -> float:
+    km_max    = KM_MAX.get(category, 50.0)
+    hours_max = HOURS_MAX.get(category, 48.0)
+    w_space   = WEIGHTS_SPACE.get(category, 0.5)
+    w_time    = WEIGHTS_TIME.get(category, 0.5)
+
+    dist_km          = haversine_km(lat1, lon1, lat2, lon2)
+    time_diff_hours  = abs((time1 - time2).total_seconds()) / 3600
+
+    normalized_dist  = dist_km / km_max   if km_max   > 0 else 0
+    normalized_time  = time_diff_hours / hours_max if hours_max > 0 else 0
+
+    return w_space * normalized_dist + w_time * normalized_time
+```
+
+---
+
+## Category Isolation
+
+Events from different categories are **never** clustered together, regardless of how close they are in space and time. The clustering job iterates over categories independently:
+
+```python
+categories = list(set(e.category for e in new_events))
+
+for category in categories:
+    cat_events = [e for e in new_events if e.category == category]
+    active_incidents = fetch_active_incidents(session, category=category)
+
+    for event in cat_events:
+        best_incident = find_closest_incident(event, active_incidents, category)
+        if best_incident:
+            assign_event_to_incident(session, event, best_incident)
+        else:
+            create_new_incident(session, event)
+```
+
+A `conflict_battle` event at (36.82°N, 36.44°E) and a `wildfire_hotspot` event at the same coordinates at the same time will produce **two separate incidents** — one with `category = "conflict"`, one with `category = "wildfire"`.
+
+---
+
+## min_samples by Source Class
+
+DBSCAN's `min_samples` parameter sets the minimum number of neighborhood points required to form a core point (and therefore a cluster). GeoSentinel sets this based on the independence class of the contributing sources:
+
+```python
+MIN_SAMPLES_BY_CLASS = {
+    "sensor":         1,  # A single FIRMS hotspot or USGS earthquake is sufficient
+    "field_reported": 1,  # A single ACLED field report is sufficient
+    "media_derived":  2,  # Requires at least 2 independent media-derived reports
+}
+```
+
+| Class | `min_samples` | Rationale |
+|---|---|---|
+| `sensor` | 1 | Physical sensor data (satellite, seismograph, AIS/ADS-B) is self-evidencing. One detection creates an incident. |
+| `field_reported` | 1 | Field organizations like ACLED conduct independent verification before publication. Single reports are trustworthy. |
+| `media_derived` | 2 | GDELT and Liveuamap extract events from news articles. A single article about an event that appears in two outlets is still just one source. Two separate `media_derived` observations are required. |
+
+When all events in a candidate cluster are `media_derived`, `min_samples` is set to 2. A lone GDELT extraction with no corroborating observation becomes a noise point in DBSCAN terms and is not promoted to an incident until a second `media_derived` or any `sensor`/`field_reported` observation arrives.
+
+---
+
+## Canonical Point Calculation
+
+When multiple events are assigned to the same incident, the incident's representative location (`canonical_point`) is the **confidence-weighted centroid** of all linked events:
+
+```python
+def compute_canonical_point(events: list[EventsCanonical]) -> tuple[float, float]:
+    total_weight = sum(e.confidence for e in events)
+    if total_weight == 0:
+        # Fall back to the first event's location if all confidences are zero
+        lat, lon = _parse_geometry_coords(events[0].location_point)
+        return lat, lon
+
+    lat = sum(_parse_geometry_coords(e.location_point)[0] * e.confidence
+              for e in events) / total_weight
+    lon = sum(_parse_geometry_coords(e.location_point)[1] * e.confidence
+              for e in events) / total_weight
+
+    return lat, lon
+```
+
+A FIRMS satellite hotspot (high confidence) pulls the canonical point toward its detected location more strongly than a GDELT media extraction (low confidence), which may have geocoded the event to a city centroid rather than the actual fire perimeter.
+
+The canonical geometry (`canonical_geometry`) is the convex hull of all event points when there are three or more distinct locations; otherwise a 5 km buffer around the canonical point is used.
+
+---
+
+## Aggregated Metrics
+
+When events are assigned to an incident (either on creation or via `assign_event_to_incident`), the incident's aggregate metrics are recalculated:
+
+| Field in `incidents` | Aggregation | Notes |
+|---|---|---|
+| `severity_max` | `max(events.severity)` | Peak severity observed across all linked events |
+| `severity_latest` | `severity` of the most recently linked event | Reflects current intensity; may decrease if the situation de-escalates |
+| `confidence` | Weighted by independence class (see [Confidence & Severity](/concepts/confidence-severity)) | Sensor observations boost confidence more than media-derived |
+| `fatalities_total` | `max(events.fatalities)` | **MAX, not SUM** — avoids counting the same deaths multiple times when sources report the same toll |
+| `source_count` | `len(set(events.source))` | Number of distinct source identifiers contributing to the incident |
+| `observation_count` | `len(events)` | Total number of individual event records linked to the incident |
+
+<Warning>
+  `fatalities_total` is deliberately calculated as `MAX`, not `SUM`. ACLED, GDELT, and Liveuamap often report the same casualty figure for the same event. Summing them would multiply the reported death toll by the number of sources, producing wildly inflated figures.
+</Warning>
+
+---
+
+## Running the Clustering Job
+
+The clustering job is implemented in `backend/jobs/clustering_job.py` and can be run directly:
+
+```bash
+python -m backend.jobs.clustering_job
+```
+
+It reads `DATABASE_URL` from the environment (defaults to `postgresql://postgres:postgres@localhost:5432/geosentinel`).
+
+When invoked, `run_clustering_job()`:
+1. Fetches all `events_canonical` rows with `event_time >= last_run_time` (defaults to the last 24 hours if `last_run_time` is not provided).
+2. Iterates over each category found in the new events.
+3. For each event, attempts to find the closest active incident using `find_closest_incident()`.
+4. If a matching incident is found (normalized distance `< epsilon`), calls `assign_event_to_incident()`, which updates the incident's metrics and triggers a `→ updated` state transition.
+5. If no matching incident is found, calls `create_new_incident()` to create a new `open` incident seeded with the event's data.
+6. Returns a summary dict: `{"created": N, "assigned": M, "total_events": K}`.
+
+```python
+result = run_clustering_job(session)
+# {"created": 12, "assigned": 47, "total_events": 59}
+```
+
+<Tip>
+  In production, schedule the clustering job to run every 5–15 minutes via a cron job or task scheduler to keep incidents current with incoming event streams.
+</Tip>

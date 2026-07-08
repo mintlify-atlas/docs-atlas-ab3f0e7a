@@ -1,0 +1,262 @@
+---
+title: "Incidents API: List and Retrieve Geospatial Incidents"
+sidebarTitle: "Incidents"
+description: "GET /v1/incidents lists incidents with bbox, category, status, severity, and source filters. GET /v1/incidents/{id} retrieves a single incident by UUID."
+---
+
+The Incidents API is the primary read interface of GeoSentinel. An incident is a deduplicated, spatio-temporally clustered aggregate of one or more canonical events sourced from NASA FIRMS, USGS, GDELT, ACLED, and other ingestors. Incidents move through a lifecycle (`open → updated → stale → closed / false_positive`) and expose computed fields such as `severity_max`, `confidence`, and `fatalities_total` that consolidate data across all linked events. Both endpoints are read-only and require no authentication.
+
+---
+
+## `GET /v1/incidents`
+
+Returns a paginated list of incidents matching the supplied filters. By default, only incidents in `open` or `updated` status are returned, ordered by `last_seen` descending.
+
+### Query Parameters
+
+<ParamField query="bbox" type="string" optional>
+  Bounding box filter expressed as four comma-separated decimal values: `lon_min,lat_min,lon_max,lat_max`. Incidents whose `canonical_point` falls **within** the envelope are returned. The filter uses PostGIS `ST_Within` against a `ST_MakeEnvelope` built from the four values in SRID 4326.
+
+  Example: `-10.0,35.0,5.0,45.0` (Iberian Peninsula)
+</ParamField>
+
+<ParamField query="category" type="string" optional>
+  Filter incidents to a single event category. Must be one of the following values:
+
+  | Value | Description |
+  |-------|-------------|
+  | `conflict` | Armed conflict and battle events |
+  | `disaster_natural` | Earthquakes, floods, and other natural disasters |
+  | `wildfire` | Active fire and wildfire hotspots |
+  | `mobility` | Significant population or vehicle movement |
+  | `humanitarian` | Humanitarian crises and relief operations |
+  | `other` | Events that do not fit any primary category |
+</ParamField>
+
+<ParamField query="status" type="string" default="open,updated" optional>
+  Comma-separated list of lifecycle statuses to include in the result set. Defaults to `open,updated` when the parameter is omitted. Valid status values:
+
+  | Value | Meaning |
+  |-------|---------|
+  | `open` | Newly created incident, not yet re-observed |
+  | `updated` | Incident received at least one new linked event since creation |
+  | `stale` | No new observations for an extended period |
+  | `closed` | Incident confirmed as ended |
+  | `false_positive` | Incident marked as erroneous by a correction |
+
+  Note: `false_positive` records are excluded even when present in this list unless `include_fp=true` is also set.
+</ParamField>
+
+<ParamField query="since" type="string" optional>
+  ISO 8601 datetime string. Only incidents where `last_seen >= since` are returned. Accepts UTC timestamps with or without the `Z` suffix.
+
+  Example: `2025-01-01T00:00:00Z`
+</ParamField>
+
+<ParamField query="min_severity" type="float" optional>
+  Minimum value for the `severity_max` field. Only incidents with `severity_max >= min_severity` are returned. Must be between `0` and `10` inclusive.
+</ParamField>
+
+<ParamField query="min_confidence" type="float" optional>
+  Minimum value for the `confidence` field. Only incidents with `confidence >= min_confidence` are returned. Must be between `0` and `10` inclusive.
+</ParamField>
+
+<ParamField query="sources" type="string" optional>
+  Comma-separated list of source names. Only incidents whose `sources` array overlaps with the supplied list are returned. Uses a PostgreSQL array `&&` (overlap) operator.
+
+  Example: `firms,usgs`
+</ParamField>
+
+<ParamField query="include_fp" type="boolean" default="false" optional>
+  When `true`, incidents with status `false_positive` are included in the result set even if `false_positive` is not present in the `status` filter. Defaults to `false`.
+</ParamField>
+
+<ParamField query="page" type="integer" default="1" optional>
+  1-based page number. Must be `>= 1`. Use together with `limit` to paginate through large result sets.
+</ParamField>
+
+<ParamField query="limit" type="integer" default="20" optional>
+  Maximum number of incidents to return per page. Must be `<= 100`. Defaults to `20`.
+</ParamField>
+
+<ParamField query="aoi_id" type="string (UUID)" optional>
+  UUID of a saved Area of Interest. When provided, only incidents whose `canonical_point` intersects the AOI's geometry are returned. The filter uses PostGIS `ST_Intersects`. If the supplied UUID does not match any AOI, the spatial filter is silently skipped.
+
+  Example: `550e8400-e29b-41d4-a716-446655440000`
+</ParamField>
+
+### Response Schema
+
+`200 OK` — returns an `IncidentListResponse` object.
+
+<ResponseField name="total" type="integer">
+  Total number of incidents matching the applied filters, regardless of pagination.
+</ResponseField>
+
+<ResponseField name="page" type="integer">
+  The current page number, mirroring the `page` query parameter.
+</ResponseField>
+
+<ResponseField name="incidents" type="array of IncidentResponse">
+  Array of incident objects for the current page, ordered by `last_seen` descending.
+
+  <Expandable title="IncidentResponse fields">
+    <ResponseField name="incident_id" type="string (UUID)">
+      Unique identifier for the incident. Primary key in the `incidents` table.
+    </ResponseField>
+
+    <ResponseField name="status" type="string">
+      Current lifecycle status. One of: `open`, `updated`, `stale`, `closed`, `false_positive`.
+    </ResponseField>
+
+    <ResponseField name="category" type="string">
+      High-level event category assigned during clustering. One of: `conflict`, `disaster_natural`, `wildfire`, `mobility`, `humanitarian`, `other`.
+    </ResponseField>
+
+    <ResponseField name="event_type" type="string">
+      Fine-grained event type within the category. Examples: `conflict_battle`, `wildfire_hotspot`, `earthquake`. Derived from the source data (CAMEO code, ACLED classification, etc.).
+    </ResponseField>
+
+    <ResponseField name="canonical_point" type="object | null">
+      The representative geographic point of the incident, computed as the confidence-weighted centroid of all linked events. `null` if no valid coordinates are available.
+
+      <Expandable title="IncidentPoint fields">
+        <ResponseField name="lon" type="float">
+          Longitude in decimal degrees (WGS 84).
+        </ResponseField>
+        <ResponseField name="lat" type="float">
+          Latitude in decimal degrees (WGS 84).
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+
+    <ResponseField name="first_seen" type="string (datetime, UTC)">
+      ISO 8601 timestamp of the earliest linked event. Timezone-aware (UTC).
+    </ResponseField>
+
+    <ResponseField name="last_seen" type="string (datetime, UTC)">
+      ISO 8601 timestamp of the most recent linked event. Timezone-aware (UTC). Used for `since` filtering and default sort order.
+    </ResponseField>
+
+    <ResponseField name="severity_max" type="float | null">
+      Highest severity score recorded across all linked events, on a 0–10 scale. `null` if no severity data is available. Database constraint enforces `BETWEEN 0 AND 10`.
+    </ResponseField>
+
+    <ResponseField name="severity_latest" type="float | null">
+      Severity score of the most recent linked event, on a 0–10 scale. `null` if not available.
+    </ResponseField>
+
+    <ResponseField name="confidence" type="float | null">
+      Aggregated confidence score for the incident, computed as a source-independence-weighted average with a 6-hour penalty for `media_derived` sources. Range: 0–10. `null` if not computed.
+    </ResponseField>
+
+    <ResponseField name="fatalities_total" type="integer | null">
+      Total fatalities reported across all linked events. Sourced primarily from ACLED and GDELT. `null` if no fatality data is available.
+    </ResponseField>
+
+    <ResponseField name="sources" type="array of strings | null">
+      Deduplicated list of source identifiers that contributed events to this incident. Examples: `["firms", "usgs"]`, `["gdelt", "acled"]`. `null` if empty.
+    </ResponseField>
+
+    <ResponseField name="observation_count" type="integer | null">
+      Total number of canonical events linked to this incident across all ingestion runs. `null` if not counted.
+    </ResponseField>
+
+    <ResponseField name="linked_event_ids" type="array of integers | null">
+      Internal integer IDs of all `events_canonical` records that belong to this incident. `null` if the incident has no linked events.
+    </ResponseField>
+
+    <ResponseField name="raw_payload" type="object | null">
+      Raw JSON payload from the **first** linked canonical event, as received from the originating data source before normalisation. Useful for debugging and provenance tracing. `null` if no linked events exist.
+    </ResponseField>
+
+    <ResponseField name="actors" type="array of objects | null">
+      Actor objects from the **first** linked canonical event. Shape depends on the source (GDELT actor fields, ACLED actor fields, etc.). `null` if no actor data is present.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Examples
+
+```bash
+# Active incidents (open + updated, default page size)
+curl "http://localhost:8000/v1/incidents"
+
+# Filter by bounding box (Iberian Peninsula)
+curl "http://localhost:8000/v1/incidents?bbox=-10.0,35.0,5.0,45.0"
+
+# High-severity conflict incidents
+curl "http://localhost:8000/v1/incidents?category=conflict&min_severity=6.0"
+
+# Multiple sources, custom page size
+curl "http://localhost:8000/v1/incidents?sources=firms,usgs&limit=50&page=2"
+
+# Including false positives, since a date
+curl "http://localhost:8000/v1/incidents?include_fp=true&since=2025-01-01T00:00:00Z"
+
+# Incidents within an AOI
+curl "http://localhost:8000/v1/incidents?aoi_id=550e8400-e29b-41d4-a716-446655440000"
+```
+
+---
+
+## `GET /v1/incidents/{incident_id}`
+
+Retrieves a single incident by its UUID. Returns the full `IncidentResponse` object, identical in shape to the items in the `incidents` array of the list endpoint. The `raw_payload` and `actors` fields are populated from the first linked canonical event.
+
+### Path Parameters
+
+<ParamField path="incident_id" type="string (UUID)" required>
+  The UUID of the incident to retrieve. Must match the `incident_id` primary key in the `incidents` table.
+
+  Example: `550e8400-e29b-41d4-a716-446655440000`
+</ParamField>
+
+### Response Schema
+
+`200 OK` — returns a single `IncidentResponse` object. See the field descriptions in the [list endpoint response](#response-schema) above — the schema is identical.
+
+### Errors
+
+| Status | Detail | Condition |
+|--------|--------|-----------|
+| `404` | `Incident not found` | No incident with the given UUID exists in the database |
+| `422` | Validation error | The supplied `incident_id` is not a valid UUID format |
+
+### Example
+
+```bash
+curl "http://localhost:8000/v1/incidents/550e8400-e29b-41d4-a716-446655440000"
+```
+
+Example response:
+
+```json
+{
+  "incident_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "open",
+  "category": "conflict",
+  "event_type": "conflict_battle",
+  "canonical_point": {
+    "lon": 36.8,
+    "lat": 47.1
+  },
+  "first_seen": "2025-01-10T14:23:00Z",
+  "last_seen": "2025-01-15T09:11:00Z",
+  "severity_max": 7.5,
+  "severity_latest": 6.8,
+  "confidence": 6.2,
+  "fatalities_total": 45,
+  "sources": ["gdelt", "acled"],
+  "observation_count": 12,
+  "linked_event_ids": [1024, 1031, 1089],
+  "raw_payload": {
+    "globalEventId": "1091234567",
+    "sqlDate": "20250115",
+    "actor1Name": "MILITARY"
+  },
+  "actors": [
+    { "name": "MILITARY", "geo_country": "UA" }
+  ]
+}
+```

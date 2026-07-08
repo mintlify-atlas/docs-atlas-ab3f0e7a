@@ -1,0 +1,182 @@
+---
+title: "AIS Vessel Tracking via AISStream Relay"
+sidebarTitle: "AIS Vessels"
+description: "How GeoSentinel's ais-relay microservice streams real-time vessel positions from AISStream WebSocket and serves them per active AOI bounding box."
+---
+
+GeoSentinel tracks vessel movements in real time through a dedicated **ais-relay** microservice that maintains a persistent WebSocket connection to the AISStream global AIS feed. AIS (Automatic Identification System) is a transponder-based vessel identification and tracking system mandated for commercial ships above 300 GT by the IMO — it broadcasts position, speed, heading, vessel type, and identity on VHF radio every 2–10 seconds. The ais-relay is a FastAPI microservice running on port 8003 that normalizes incoming AIS frames into a typed vessel cache and serves bounding-box queries to the main GeoSentinel backend.
+
+## What AIS Is
+
+AIS transponders broadcast VHF radio messages containing:
+
+- **MMSI** — Maritime Mobile Service Identity (9-digit vessel identifier)
+- **Position** — latitude and longitude (WGS84)
+- **Speed Over Ground (SOG)** — in knots
+- **Course Over Ground (COG)** — in degrees
+- **True Heading** — in degrees (0–360)
+- **Navigational Status** — underway, anchored, moored, restricted maneuverability, etc.
+- **Ship Type** — encoded as an ITU type code (cargo, tanker, passenger, military, etc.)
+- **Ship Name and Callsign** — from static AIS messages
+- **Flag** — derived from MMSI prefix (ITU country code mapping)
+
+AISStream aggregates global AIS data from a network of terrestrial and satellite receivers and delivers it over a WebSocket stream in near-real time (sub-second from vessel transmission to relay receipt).
+
+## Architecture
+
+```
+AISStream WebSocket (wss://stream.aisstream.io/v0/stream)
+       ↓  AISSTREAM_API_KEY
+ ais-relay (FastAPI, port 8003)
+       ├── Persistent WebSocket connection (auto-reconnect with backoff)
+       ├── Parses PositionReport + PositionReportInterval messages
+       ├── VesselStore (in-memory dict keyed by MMSI, Lock-protected)
+       ├── Dark-ship detection (isDark=true if no update > 20 min)
+       ├── Mock fallback if AISSTREAM_API_KEY not set
+       └── GET /api/ais/v1/list-vessels?neLat=&neLon=&swLat=&swLon=
+              ↓
+ main backend
+       └── GET /v1/ais-vessels → frontend
+```
+
+The `AISSTREAM_API_KEY` never leaves the relay. The main backend communicates with the relay over an internal HTTP API and never touches the AISStream WebSocket directly.
+
+## WebSocket Connection and Subscription
+
+The relay connects to `wss://stream.aisstream.io/v0/stream` and sends a subscription message containing the API key and a list of bounding boxes to subscribe to:
+
+```python
+subscribe_message = json.dumps({
+    "APIkey": config.AISSTREAM_API_KEY,
+    "BoundingBoxes": bbox_list
+})
+await ws.send(subscribe_message)
+```
+
+WebSocket pings are sent every 30 seconds with a 60-second timeout. If the connection drops, the relay reconnects with exponential backoff (base 2 seconds, cap 60 seconds — configurable via `RECONNECT_BACKOFF_BASE` and `RECONNECT_BACKOFF_MAX`).
+
+## Mock Fallback
+
+If `AISSTREAM_API_KEY` is not set or AISStream is unavailable, the relay falls back to serving mock vessel data. This allows the frontend to display vessel layer UI during development without a live AIS subscription.
+
+## Message Parsing
+
+Only `PositionReport` and `PositionReportInterval` message types are processed. Each parsed vessel record is stored in the `VesselStore` indexed by MMSI:
+
+```python
+def _parse_aisstream_message(msg: dict) -> AISVessel | None:
+    msg_type = msg.get("MessageType", "")
+    if msg_type not in ("PositionReport", "PositionReportInterval"):
+        return None
+    # ... extract lat, lon, sog, cog, heading, nav_status, mmsi, name
+```
+
+Navigational status codes are decoded from numeric ITU values to named strings:
+
+| ITU code | Status string |
+|---|---|
+| 0 | `under_way_using_engine` |
+| 1 | `anchored` |
+| 2 | `not_under_command` |
+| 3 | `restricted_maneuverability` |
+| 4 | `constrained_by_draught` |
+| 5 | `moored` |
+| 6 | `aground` |
+| 7 | `engaged_in_fishing` |
+| 8 | `under_way_sailing` |
+| 15 | `not_defined` |
+
+## Vessel Type Mapping
+
+AIS ship type codes are mapped to named categories. Selected examples:
+
+| AIS type code | Vessel type string |
+|---|---|
+| 35 | `military_ops` |
+| 51 | `search_and_rescue` |
+| 52 | `tug` |
+| 55 | `law_enforcement` |
+| 60–69 | `passenger` |
+| 70–79 | `cargo` |
+| 80–89 | `tanker` |
+
+## Dark Ship Detection
+
+A vessel is marked `isDark=true` if no AIS update has been received within the threshold window (default: 20 minutes):
+
+```python
+def mark_dark_ships(self):
+    threshold_seconds = config.DARK_SHIP_THRESHOLD_MIN * 60  # default: 1200s
+    for v in self._vessels.values():
+        last = datetime.fromisoformat(v.lastAisUpdate.replace("Z", "+00:00"))
+        age = (now - last).total_seconds()
+        v.isDark = age > threshold_seconds
+```
+
+Dark-ship detection runs on a background schedule. The `DARK_SHIP_THRESHOLD_MIN` environment variable (default `20`) is configurable.
+
+## Querying Vessels by Bounding Box
+
+The relay's vessel list endpoint filters the `VesselStore` by geographic bounding box:
+
+```
+GET /api/ais/v1/list-vessels?neLat={ne_lat}&neLon={ne_lon}&swLat={sw_lat}&swLon={sw_lon}
+```
+
+Filtering is in-memory O(n) over the vessel cache — no database involved. Coordinates are compared directly:
+
+```python
+if sw_lat <= v.location.latitude <= ne_lat and sw_lon <= v.location.longitude <= ne_lon:
+    result.append(v)
+```
+
+## Frontend API Endpoint
+
+The main backend exposes AIS data through:
+
+```
+GET /v1/ais-vessels
+```
+
+This endpoint queries **all active AOI bounding boxes in parallel** using a `ThreadPoolExecutor` with 8 workers, then deduplicates the aggregated vessel list by vessel `id` (MMSI-based). If the relay has not received any updates recently, the response includes:
+
+```http
+X-Stale: true
+```
+
+The main backend propagates this header to the frontend, which can use it to show a staleness indicator on the vessel layer.
+
+## `X-Stale` Header
+
+The relay sets `X-Stale: true` in its response when the `VesselStore` has not received any update from the AISStream WebSocket within the cache TTL window. The ingestor logs a warning when it receives stale data and records `stale_cache` in `source_refs` for any events processed from it.
+
+## Relay Configuration
+
+| Environment variable | Default | Description |
+|---|---|---|
+| `AISSTREAM_API_KEY` | _(empty)_ | AISStream API key — relay will use mock if unset |
+| `AIS_RELAY_PORT` | `8003` | Listening port for the relay HTTP server |
+| `AIS_RELAY_URL` | `http://localhost:8003` | URL the main backend uses to reach the relay |
+| `AIS_SOURCE` | `mock` | Set to `aisstream` to enable live WebSocket |
+| `DARK_SHIP_THRESHOLD_MIN` | `20` | Minutes without update before `isDark=true` |
+| `AISSTREAM_WS_URL` | `wss://stream.aisstream.io/v0/stream` | AISStream WebSocket URL |
+| `RECONNECT_BACKOFF_BASE` | `2` | Initial reconnect delay in seconds |
+| `RECONNECT_BACKOFF_MAX` | `60` | Maximum reconnect delay in seconds |
+| `AIS_SUBSCRIBE_BBOX` | _(empty)_ | JSON array of subscription bounding boxes |
+
+Register for an API key at [https://aisstream.io](https://aisstream.io).
+
+## Environment Variable Required
+
+```bash
+AISSTREAM_API_KEY=your_aisstream_api_key
+AIS_RELAY_URL=http://localhost:8003    # for main backend → relay communication
+```
+
+<Warning>
+The MMSI identifier is a unique vessel fingerprint. Per the AISStream Terms of Service and GeoSentinel's security spec, **individual MMSI values are never included in the public `/v1/incidents` API response**. Only aggregated, zone-level vessel data is surfaced externally.
+</Warning>
+
+<Note>
+AISStream commercial plans are required for high-frequency production use. The free tier provides limited throughput. For GeoSentinel deployments serving multiple active AOIs simultaneously, verify your AISStream plan covers the message rate for your combined bounding box area.
+</Note>

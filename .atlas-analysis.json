@@ -1,0 +1,110 @@
+{
+  "projectType": "saas",
+  "projectName": "GeoSentinel",
+  "projectDescription": "A real-time geospatial incident monitoring platform that aggregates events from multiple open sources (GDELT, ACLED, FIRMS, USGS), normalizes them to a canonical model, applies spatio-temporal clustering, and exposes them via a REST API with a React/Mapbox dashboard.",
+  "theme": "luma",
+  "primaryColor": "#04baed",
+  "lightColor": "#0c74bf",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Data Sources",
+            "pages": [
+              "data-sources/overview",
+              "data-sources/gdelt",
+              "data-sources/acled",
+              "data-sources/firms",
+              "data-sources/usgs",
+              "data-sources/military-flights",
+              "data-sources/ais-vessels"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/canonical-model",
+              "concepts/clustering",
+              "concepts/incident-lifecycle",
+              "concepts/confidence-severity"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/local-setup",
+              "deployment/docker-production",
+              "deployment/environment-variables"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "api/overview"
+            ]
+          },
+          {
+            "group": "Endpoints",
+            "pages": [
+              "api/incidents",
+              "api/aoi",
+              "api/corrections",
+              "api/military-flights",
+              "api/ais-vessels",
+              "api/admin",
+              "api/health"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Multi-source event ingestion (GDELT, ACLED, FIRMS NASA, USGS, OpenSky, AISStream)",
+    "Canonical data normalization with UTC timestamps and WGS84 coordinates",
+    "DBSCAN spatio-temporal clustering to group events into incidents",
+    "Full incident lifecycle state machine (open → updated → stale → closed / false_positive)",
+    "Areas of Interest (AOI) with PostGIS spatial filtering",
+    "Human-in-the-loop corrections API with append-only audit trail",
+    "Military flight relay (OpenSky) and AIS vessel tracking relay",
+    "React + Mapbox GL dashboard with 2D/3D map layers and real-time polling",
+    "Event validation with quarantine for rejected payloads",
+    "Docker Compose deployment for both development and production"
+  ],
+  "publicApiSurface": [
+    "GET /v1/incidents — list incidents with bbox, category, status, severity, confidence, sources, aoi_id filters",
+    "GET /v1/incidents/{incident_id} — get single incident detail",
+    "POST /v1/aoi — create area of interest",
+    "GET /v1/aoi — list active AOIs",
+    "GET /v1/aoi/{aoi_id} — get AOI by ID",
+    "PUT /v1/aoi/{aoi_id} — update AOI",
+    "DELETE /v1/aoi/{aoi_id} — soft-delete AOI",
+    "GET /v1/aoi/{aoi_id}/incidents — list incidents within AOI",
+    "POST /v1/corrections — apply operator correction (false_positive, close, reclassify, relocate, merge)",
+    "GET /v1/military-flights — list military flights within active AOI bboxes",
+    "GET /v1/ais-vessels — list AIS vessels within active AOI bboxes",
+    "POST /v1/admin/run/{source} — trigger ingestion job (usgs, firms, gdelt, acled, clustering)",
+    "POST /v1/admin/run/lifecycle — trigger incident lifecycle job",
+    "POST /v1/admin/run/all — trigger all ingestion + clustering + lifecycle jobs",
+    "GET /v1/admin/run/status/{job_id} — poll async job status",
+    "GET /v1/health — service health check",
+    "GET /v1/health/db — database connectivity check",
+    "GET /v1/seed — insert test data (3 sample incidents)"
+  ]
+}
