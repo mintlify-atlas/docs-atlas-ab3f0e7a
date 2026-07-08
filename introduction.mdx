@@ -54,6 +54,7 @@ GeoSentinel is a real-time geospatial incident monitoring platform built for dev
   - **No Prometheus metrics** — the `/metrics` scrape endpoint and per-ingestor counters (`ingestor_poll_total`, `ingestor_errors_total`) are not yet wired up.
   - **No circuit breaker** — ingestor failures do not trip a circuit breaker; each poll retries independently with backoff.
   - **Synchronous ingestor pipeline** — ingestors call the validation → normalisation → clustering pipeline synchronously. There is no Kafka or Redis Streams event bus yet; the architectural spec describes the target async design, but the current implementation is a direct in-process call.
+  - **No archive/purge job** — the `incidents_archive` table has not been created and no background job exists to purge or archive aged-out incidents.
 </Warning>
 
 ## Data Licenses
@@ -67,4 +68,5 @@ The following table summarises the licence terms for every data source integrate
 | GDELT Project | Public domain | None |
 | ACLED | CC BY-NC 4.0 | **Non-commercial use only** |
 | OpenSky Network | OpenSky Terms of Use | Non-commercial use permitted |
+| MarineTraffic | Commercial | Raw data redistribution not permitted |
 | Mapbox GL JS | Commercial | Requires a valid Mapbox access token — usage limits apply per plan |

@@ -1,7 +1,7 @@
 ---
 title: "Canonical Event Model: GeoSentinel's Unified Schema"
 sidebarTitle: "Canonical Model"
-description: "How GeoSentinel normalizes raw events from six sources into a single EventCanonicalCreate schema with UTC timestamps, WGS84 coordinates, and typed categories."
+description: "How GeoSentinel normalizes raw events from six sources into EventCanonicalCreate with UTC timestamps, WGS84 coordinates, and typed categories."
 ---
 
 GeoSentinel ingests data from six structurally different sources — GDELT, ACLED, FIRMS, USGS, ADS-B, and MarineTraffic — each with its own timestamp format, coordinate convention, event vocabulary, and confidence characteristics. Without a unifying layer, downstream processing (clustering, severity scoring, the API) would need to understand every source independently. The canonical model solves this by requiring every source mapper to emit a single `EventCanonicalCreate` object before any data is written to `events_canonical`. All dates are UTC, all coordinates are WGS84, all categories come from a fixed enum, and all severity and confidence values are normalized to the `[0.0, 10.0]` range.
@@ -63,6 +63,7 @@ class EventCanonicalCreate(BaseModel):
     # Source provenance
     source_url:           str | None        = None
     source_refs:          list[str] | None  = None
+    raw_event_id:         int | None        = None
     # Flags
     is_confirmed:         bool = False
     is_rumor:             bool = False
@@ -136,7 +137,7 @@ class EventCanonicalCreate(BaseModel):
 </ParamField>
 
 <ParamField body="source_refs" type="list[string]">
-  Array of supplementary references or notes. Mappers use this to annotate date normalization decisions — for example, ACLED mappers append a note like `"date_only:2024-01-15 → 00:00:00 UTC assumed"`.
+  Array of supplementary references or notes. ACLED populates this with the raw `notes` field (truncated to 500 characters) and the originating `source` publication. FIRMS populates it with satellite, instrument, and brightness values.
 </ParamField>
 
 <ParamField body="is_rumor" type="boolean" default="false">
@@ -233,15 +234,15 @@ Every source uses a different timestamp convention. Normalization to UTC happens
 
 | Source | Original Field | Original Format | Conversion |
 |---|---|---|---|
-| ACLED | `event_date` | `YYYY-MM-DD` (date only, no time) | Assign `00:00:00 UTC`; append note to `source_refs` |
-| GDELT | `SQLDATE` | `YYYYMMDD` integer | Parse as date, assign `00:00:00 UTC` |
+| ACLED | `event_date` | `YYYY-MM-DD` (date only, no time) | Assign `00:00:00 UTC` |
+| GDELT | `event_date` | `YYYY-MM-DD` string | Parse as date, assign `00:00:00 UTC` |
 | FIRMS | `acq_date` + `acq_time` | `YYYY-MM-DD` + `HHMM` | Combine and interpret directly as UTC |
 | USGS | `properties.time` | Epoch milliseconds | `datetime.fromtimestamp(ms / 1000, tz=UTC)` |
 | ADS-B | `t` | Unix epoch seconds | `datetime.fromtimestamp(t, tz=UTC)` |
 | MarineTraffic | `TIMESTAMP` | ISO 8601 with UTC offset | Convert offset to UTC |
 
 <Note>
-  ACLED and GDELT provide only a date, not a time. By convention, GeoSentinel assigns midnight UTC (`00:00:00 UTC`) and records this assumption in `source_refs`. Downstream consumers must treat these timestamps as **date-precision only**.
+  ACLED and GDELT provide only a date, not a time. By convention, GeoSentinel assigns midnight UTC (`00:00:00 UTC`). Downstream consumers must treat these timestamps as **date-precision only**.
 </Note>
 
 ---
@@ -257,7 +258,7 @@ The deduplication window covers the last **60 days** (`DEDUP_WINDOW_DAYS=60`) to
 
 | Source | `event_id_source` Construction |
 |---|---|
-| GDELT | `GLOBALEVENTID` cast to text |
+| GDELT | `id` cast to text |
 | ACLED | `data_id` cast to text |
 | FIRMS | `sha256(lat \| lon \| acq_date \| acq_time \| satellite)[:32]` — synthetic key because FIRMS has no native ID |
 | USGS | `properties.ids.split(",")[0].strip(",")` — first preferred ID from the comma-separated list |

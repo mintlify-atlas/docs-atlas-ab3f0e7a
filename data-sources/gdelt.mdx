@@ -1,7 +1,7 @@
 ---
-title: "GDELT Cloud v2 Conflict Events Ingestion"
+title: "GDELT Cloud v2 Conflict Events: Ingestion and Mapping"
 sidebarTitle: "GDELT"
-description: "How GeoSentinel ingests GDELT Cloud v2 conflict events: polling interval, CAMEO code mapping, deduplication by globalEventId, and the Bearer token auth."
+description: "How GeoSentinel ingests GDELT Cloud v2 conflict events: 5-minute polling, category/subcategory mapping, Goldstein-scale severity, and Bearer token auth."
 ---
 
 GeoSentinel pulls conflict events from the **GDELT Cloud v2 API** every five minutes, querying the `events` endpoint for fatal conflict events across a curated list of active conflict zones. GDELT (Global Database of Events, Language, and Tone) is the world's largest open-access database of human society events, constructed by monitoring worldwide news media in over 100 languages. The v2 Cloud API is a structured, normalized surface on top of this data — exposing typed `Event` objects with Goldstein scale scores, geo-coordinates, fatality flags, actor metadata, and linked articles, rather than the raw CAMEO tuples of classic GDELT.
@@ -27,7 +27,7 @@ GeoSentinel uses GDELT Cloud v2 exclusively — not the legacy GDELT Project API
 |---|---|
 | Base URL | `https://gdeltcloud.com/api/v2` |
 | Auth | `Authorization: Bearer <GDELT_API_KEY>` |
-| Events endpoint | `GET /api/v2/events` |
+| Events endpoint | `GET /events` (relative to base URL) |
 | Polling interval | Every **300 seconds** (5 minutes) |
 | Max date window | 29 days (a `DATE_WINDOW_TOO_LARGE` error is returned at 30+) |
 | Rate limit | 100 calls/month (resets on the 1st of each month) |
@@ -133,7 +133,7 @@ A Goldstein score of −7.5 (heavy armed conflict) yields a confidence of `min(1
 Events are deduplicated by the GDELT Cloud v2 stable event identifier, stored as `event_id_source`:
 
 ```python
-event_id_source = str(event.get("id", ""))  # e.g. "gdelt_ev_abc123"
+event_id_source = str(event.get("id", ""))
 ```
 
 The pipeline upserts on `(source="gdelt", event_id_source)` — re-ingesting the same event updates `ingest_time` but does not create a duplicate.

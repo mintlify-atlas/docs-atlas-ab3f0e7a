@@ -1,7 +1,7 @@
 ---
 title: "Admin Jobs API: Trigger and Monitor Data Ingestion"
 sidebarTitle: "Admin"
-description: "Async job management API for triggering GeoSentinel ingestors and lifecycle jobs. POST to start jobs, GET to poll status. Prevents duplicate concurrent runs."
+description: "Background job API for GeoSentinel ingestors and lifecycle maintenance. POST to trigger jobs, GET to poll status. Returns 409 on duplicate runs."
 ---
 
 The Admin API provides endpoints for triggering GeoSentinel's data ingestion scripts and incident lifecycle maintenance as non-blocking background tasks. Each POST endpoint immediately returns a `202 Accepted` response containing a `job_id` UUID, which you can then poll with the status endpoint until the job reaches `completed` or `failed`. All job state is tracked in a shared in-memory `JOBS` dictionary protected by an `asyncio.Lock`, and the API refuses to start a second instance of the same job while one is already running — returning `409 Conflict` with the ID of the existing job instead.

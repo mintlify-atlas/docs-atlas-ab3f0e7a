@@ -1,7 +1,7 @@
 ---
-title: "Local Development Setup for GeoSentinel"
+title: "GeoSentinel Local Development Setup and Configuration"
 sidebarTitle: "Local Setup"
-description: "Set up a full GeoSentinel development environment with PostgreSQL, the FastAPI backend, React frontend, and optional military and AIS relay microservices."
+description: "Configure GeoSentinel for local development: PostgreSQL 16 + PostGIS in Docker, FastAPI backend with uv, React frontend with Vite, and optional relays."
 ---
 
 GeoSentinel's local development environment runs PostgreSQL 16 + PostGIS 3.4 in Docker while the FastAPI backend and React frontend run directly on your machine — giving you fast reloads without rebuilding containers on every change. The backend is managed with `uv` for deterministic dependency resolution, and the frontend uses Vite for sub-second HMR. Two optional relay microservices (military flights and AIS vessel tracking) can be started independently when you need to test those data layers.
@@ -19,7 +19,7 @@ Before you begin, make sure the following are installed and available on your `P
   ```
 - **API keys** for the external data sources you want to enable:
   | Source | Purpose | Registration |
-  |--------|---------|--------------|
+  |--------|---------|--------------| 
   | GDELT Cloud v2 | Conflict events | https://gdeltcloud.com/dashboard |
   | ACLED | Structured conflict data | https://acleddata.com/myacled |
   | FIRMS (NASA) | Active wildfire hotspots | https://firms.modaps.eosdis.nasa.gov/api/map_key/ |
@@ -205,15 +205,22 @@ This is idempotent — running it multiple times will upsert rather than duplica
 
 ## Running Ingestors
 
-Each ingestor is a standalone Python script that loads `.env` from the project root automatically. Run them from the **project root** (not from inside `backend/`):
+Each ingestor is a standalone Python script that loads `.env` from the project root automatically. Run them from inside the **`backend/`** directory so that `uv` picks up the correct virtual environment and all backend dependencies are available:
 
 | Ingestor | Command | Notes |
 |----------|---------|-------|
-| USGS Earthquakes | `uv run python backend/scripts/run_usgs.py` | Pulls last 24 h, `minmagnitude=4.0`, polling every 3 min |
-| FIRMS Wildfires | `uv run python backend/scripts/run_firms.py` | Requires `FIRMS_MAP_KEY`; filters by active AOI bounding boxes |
-| GDELT Conflicts | `uv run python backend/scripts/run_gdelt.py` | Requires `GDELT_API_KEY`; 5-min window via GDELT Cloud v2 |
-| ACLED Conflicts | `uv run python backend/scripts/run_acled.py` | Requires `ACLED_USERNAME` + `ACLED_PASSWORD`; backfills 48 h |
-| Clustering | `uv run python backend/scripts/run_clustering.py` | DBSCAN spatio-temporal clustering; run after any ingestor |
+| USGS Earthquakes | `uv run python scripts/run_usgs.py` | Pulls last 24 h, `minmagnitude=4.0`, polling every 3 min |
+| FIRMS Wildfires | `uv run python scripts/run_firms.py` | Requires `FIRMS_MAP_KEY`; filters by active AOI bounding boxes |
+| GDELT Conflicts | `uv run python scripts/run_gdelt.py` | Requires `GDELT_API_KEY`; 5-min window via GDELT Cloud v2 |
+| ACLED Conflicts | `uv run python scripts/run_acled.py` | Requires `ACLED_USERNAME` + `ACLED_PASSWORD`; backfills 48 h |
+| Clustering | `uv run python scripts/run_clustering.py` | DBSCAN spatio-temporal clustering; run after any ingestor |
+
+For example, to run the USGS ingestor:
+
+```bash
+cd backend
+uv run python scripts/run_usgs.py
+```
 
 <Note>
   Always run the **clustering job** after ingesting new events. The clustering step is what groups raw `events_canonical` rows into the `incidents` that the API and frontend display.

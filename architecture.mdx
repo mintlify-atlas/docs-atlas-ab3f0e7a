@@ -1,5 +1,5 @@
 ---
-title: "GeoSentinel System Architecture Overview"
+title: "GeoSentinel Architecture: Five-Layer Ingestion Pipeline"
 sidebarTitle: "Architecture"
 description: "Five-layer pipeline from raw source ingestion through validation, normalization, clustering, and REST API delivery on PostgreSQL/PostGIS."
 ---
@@ -57,7 +57,7 @@ GeoSentinel is structured as a five-layer data pipeline that takes raw, heteroge
   <Step title="Clustering & Lifecycle — backend/jobs/">
     After normalisation, canonical events are grouped into incidents by `clustering_job.py` using DBSCAN with a mixed spatio-temporal distance metric:
 
-    ```
+    ```text
     d(e1, e2) = w_space × (haversine_km / KM_MAX) + w_time × (Δhours / HOURS_MAX)
     ```
 

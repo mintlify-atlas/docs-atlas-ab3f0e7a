@@ -1,14 +1,14 @@
 ---
-title: "Military Flight Tracking via OpenSky Relay"
+title: "Military Flight Tracking via OpenSky ADS-B Relay Service"
 sidebarTitle: "Military Flights"
-description: "How GeoSentinel's military-relay microservice filters OpenSky ADS-B data to identify military aircraft using a monthly ICAO24 hex database of ~10,000 entries."
+description: "How GeoSentinel's military-relay identifies aircraft via ADS-B category 7 and a monthly ICAO24 hex database of ~10,000 OpenSky registry entries."
 ---
 
 GeoSentinel tracks military aircraft activity in real time through a dedicated **military-relay** microservice that polls the OpenSky Network ADS-B API and filters the full state vector feed down to confirmed military aircraft. The relay is a FastAPI microservice running on port 8002 that maintains its own aircraft identification logic, database, and cache — exposing a clean internal API that the main backend queries per active AOI bounding box. Rather than relying on callsigns (which generate too many false positives) or national hex code ranges (which miss many operated aircraft), the relay uses a monthly-updated database of approximately 10,000 ICAO24 hexadecimal transponder codes confirmed as military operator/owner entries in OpenSky's own aircraft registry.
 
 ## Architecture
 
-```
+```text
 OpenSky Network (ADS-B)
        ↓  OPENSKY_CLIENT_ID + OPENSKY_CLIENT_SECRET
  military-relay (FastAPI, port 8002)
@@ -27,7 +27,7 @@ The main backend's `MilitaryIngestor` queries all active AOI bounding boxes in s
 
 ## Military Identification Strategy
 
-The relay determines if an aircraft is military using three criteria, checked in priority order:
+The relay determines if an aircraft is military using two criteria, checked in priority order inside `is_military()`:
 
 ### 1. ADS-B Category 7 (highest priority)
 
@@ -42,7 +42,7 @@ if category == 7:
 
 The hex database at `data/military_hex.txt` contains approximately 10,000 six-character ICAO24 transponder codes compiled from OpenSky's aircraft registry using military operator and owner keywords. Each line is a single uppercase hex code:
 
-```
+```text
 AE1234
 3C4A7F
 43C9B2
@@ -59,11 +59,13 @@ def is_hex_military(hex_code: str | None) -> bool:
     return normalized in load_military_hex_set()
 ```
 
-### 3. Why Not Callsigns or National Hex Ranges
+If neither criterion matches, the aircraft is not classified as military.
+
+### Why Not Callsigns or National Hex Ranges
 
 **Callsigns** like `RCH123` or `REACH456` are used extensively, but are also adopted by civilian charters, contractors, and exercise participants — producing unacceptable false-positive rates. The filter comment in the source explicitly notes: *"El filtro de callsign se omite deliberadamente: con 10 000+ hex codes de la BD de OpenSky, los callsigns tácticos generan demasiados falsos positivos."*
 
-**National hex ranges** (e.g., `AE0000–AFFFFF` for the USA, `43C000–43CFFF` for the UK RAF) are defined in `config.py` and available via `is_hex_military_by_range()`, but are also not used as primary classification — national blocks contain civilian government, coast guard, and other non-combat aircraft that would inflate military event counts.
+**National hex ranges** (e.g., `AE0000–AFFFFF` for the USA, `43C000–43CFFF` for the UK RAF) are defined in `config.py` and available via `is_hex_military_by_range()`, but are not used by `is_military()` — national blocks contain civilian government, coast guard, and other non-combat aircraft that would inflate military event counts.
 
 <Info>
 The callsign list (`CALLSIGN_PREFIXES_FULL`) in `config.py` contains 80+ verified military prefixes from community-verified FR24 data (RAF, Luftwaffe, IAF, NATO AWACS, USAF, USN, etc.) and is maintained for future use, but is not part of the active `is_military()` classification path.
@@ -112,13 +114,13 @@ These conditions are evaluated in the main `MilitaryIngestor`, not in the relay 
 
 The main backend exposes military flight data through:
 
-```
+```text
 GET /v1/military-flights
 ```
 
 This endpoint queries all active AOI bounding boxes in sequence via `MilitaryIngestor.fetch_from_relay()`:
 
-```
+```text
 GET /api/military/v1/list-military-flights
   ?neLat={max_lat}&neLon={max_lon}&swLat={min_lat}&swLon={min_lon}
 ```

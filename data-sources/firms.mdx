@@ -1,5 +1,5 @@
 ---
-title: "NASA FIRMS Active Fire Hotspot Ingestion"
+title: "NASA FIRMS Active Fire and Hotspot Ingestion Pipeline"
 sidebarTitle: "FIRMS"
 description: "How GeoSentinel ingests NASA FIRMS wildfire hotspots: CSV polling, confidence-based FRP severity mapping, type 0/1 filter, and SHA-256 deduplication."
 ---
@@ -18,7 +18,7 @@ FIRMS data has a NRT lag of approximately 3 hours from satellite overpass to API
 
 The FIRMS CSV API constructs a dynamic URL embedding the map key, product, bounding box, and day count:
 
-```
+```text
 https://firms.modaps.eosdis.nasa.gov/api/area/csv/{FIRMS_MAP_KEY}/{PRODUCT}/{lon_min,lat_min,lon_max,lat_max}/{DAYS}/
 ```
 
@@ -89,10 +89,10 @@ Severity (0–10) is derived from **Fire Radiative Power (FRP)** in megawatts �
 
 | FRP range (MW) | Severity |
 |---|---|
-| 0–3 MW | 1.0 |
-| 4–7 MW | 2.5 |
-| 8–24 MW | 5.0 |
-| 25–49 MW | 7.5 |
+| 0–3.9 MW (< 4) | 1.0 |
+| 4–7.9 MW (< 8) | 2.5 |
+| 8–24.9 MW (< 25) | 5.0 |
+| 25–49.9 MW (< 50) | 7.5 |
 | ≥ 50 MW | 10.0 |
 
 A 200 MW fire — comparable to a large forest fire crown run — would receive severity 10.0. A single burning field at 3 MW would receive severity 1.0.

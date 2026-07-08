@@ -1,5 +1,5 @@
 ---
-title: "GeoSentinel REST API Reference Overview"
+title: "GeoSentinel REST API Reference: Endpoints and Base URL"
 sidebarTitle: "Overview"
 description: "GeoSentinel exposes a versioned REST API at /v1/ built on FastAPI. All endpoints return JSON. Interactive docs available at /docs and /redoc."
 ---
@@ -10,7 +10,7 @@ GeoSentinel is a real-time geospatial incident monitoring platform that aggregat
 
 All requests in local development target:
 
-```
+```text
 http://localhost:8000
 ```
 
@@ -28,7 +28,7 @@ No API keys, bearer tokens, or session cookies are required. Every request can b
 
 All production endpoints are prefixed with `/v1/`. When breaking changes are introduced, a new prefix (e.g. `/v2/`) will be introduced without removing the previous version.
 
-```
+```text
 http://localhost:8000/v1/<resource>
 ```
 
@@ -126,13 +126,16 @@ curl "http://localhost:8000/v1/incidents?page=3&limit=50"
   <Card title="Admin Jobs" icon="gears" href="/api/admin">
     Trigger background jobs such as clustering and incident lifecycle transitions. Returns 409 if a job is already running.
 
-    `POST /v1/admin/run`
+    `POST /v1/admin/run/{source}`
+    `POST /v1/admin/run/lifecycle`
+    `POST /v1/admin/run/all`
   </Card>
   <Card title="Health" icon="heart-pulse" href="/api/health">
     Service and database health checks. Use these endpoints for liveness and readiness probes in container orchestration.
 
     `GET /v1/health`
     `GET /v1/health/db`
+    `GET /v1/seed`
   </Card>
 </CardGroup>
 

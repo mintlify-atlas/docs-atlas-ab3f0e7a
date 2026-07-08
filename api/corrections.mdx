@@ -1,7 +1,7 @@
 ---
 title: "Corrections API: Human-in-the-Loop Incident Management"
 sidebarTitle: "Corrections"
-description: "POST /v1/corrections applies operator corrections to incidents: false_positive, close, reclassify, relocate, and merge — all recorded in an append-only audit trail."
+description: "POST /v1/corrections lets operators mark false positives, close, reclassify, relocate, or merge incidents. Every correction is recorded in an audit trail."
 ---
 
 The Corrections API is GeoSentinel's human-in-the-loop override mechanism. Automated ingestion pipelines aggregate raw signals into incidents, but operators retain full authority to correct the system's output: flagging false positives, closing resolved events, reclassifying misidentified incidents, relocating those with bad coordinates, or merging duplicates into a single canonical record. Every correction — regardless of type — produces an immutable entry in the `corrections_audit` table, capturing a `before_state` and `after_state` snapshot of the incident so the full history of operator decisions is always recoverable.

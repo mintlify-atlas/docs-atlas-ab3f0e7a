@@ -1,7 +1,7 @@
 ---
-title: "Spatio-Temporal Event Clustering with DBSCAN"
+title: "Spatio-Temporal Event Clustering with DBSCAN in GeoSentinel"
 sidebarTitle: "Clustering"
-description: "How GeoSentinel's DBSCAN algorithm groups nearby concurrent events from multiple sources into single deduplicated incidents using a normalized distance metric."
+description: "How GeoSentinel's DBSCAN algorithm groups nearby concurrent events from multiple sources into deduplicated incidents using a normalized distance metric."
 ---
 
 After canonical events are validated and written to `events_canonical`, the clustering job groups them into incidents. Each row in `events_canonical` is a single observation from a single source. A real-world wildfire, battle, or earthquake is almost always reported by multiple sources simultaneously — a FIRMS satellite pass, an ACLED field report, and a GDELT media extraction may all describe the same fire within hours of each other. Without clustering, the API would expose three separate incidents where only one exists. The clustering job solves this by running a DBSCAN algorithm over unassigned events, using a normalized mixed distance metric that accounts for both geographic proximity and temporal overlap.
@@ -12,11 +12,10 @@ After canonical events are validated and written to `events_canonical`, the clus
 
 Consider a wildfire burning near the Syrian–Turkish border. Within a six-hour window:
 
-- **FIRMS** detects a thermal hotspot at (36.82°N, 36.44°E) via MODIS satellite.
-- **GDELT** extracts a news article placing the same fire at (36.80°N, 36.46°E).
-- **ACLED** logs a related displacement event at (36.83°N, 36.43°E).
+- **FIRMS** detects a thermal hotspot at (36.82°N, 36.44°E) via MODIS satellite (`category = "wildfire"`).
+- **GDELT** extracts a news article placing the same fire at (36.80°N, 36.46°E) (`category = "wildfire"`).
 
-All three events have `category = "wildfire"` and are within 4 km and 6 hours of each other. Without clustering, the API returns three separate incidents. With clustering, they collapse into one incident whose `canonical_point` is the confidence-weighted centroid of the three observations, `source_count = 3`, and `confidence` is boosted by the sensor observation (FIRMS has independence class `sensor`, weight ×2.0).
+Both events have `category = "wildfire"` and are within 4 km and 6 hours of each other. Without clustering, the API returns two separate incidents. With clustering, they collapse into one incident whose `canonical_point` is the confidence-weighted centroid of the two observations, `source_count = 2`, and `confidence` is boosted by the sensor observation (FIRMS has independence class `sensor`, weight ×2.0).
 
 The same pattern holds for conflict events (GDELT + ACLED + Liveuamap reporting the same battle), earthquakes (USGS primary + secondary network reports), and vessel interdictions (ADS-B + MarineTraffic tracking the same aircraft/ship).
 
@@ -26,7 +25,7 @@ The same pattern holds for conflict events (GDELT + ACLED + Liveuamap reporting 
 
 DBSCAN requires a pairwise distance function. Using raw kilometres and hours together produces an epsilon with no physical meaning — a 10 km gap and a 10-hour gap are not equivalent. GeoSentinel normalizes both dimensions to `[0, 1]` before combining them:
 
-```
+```text
 d(e1, e2) = w_space · (haversine_km(e1, e2) / KM_MAX)
            + w_time  · (|e1.event_time - e2.event_time| / HOURS_MAX)
 ```

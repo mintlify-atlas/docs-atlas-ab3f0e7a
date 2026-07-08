@@ -1,7 +1,7 @@
 ---
-title: "Docker Production Deployment for GeoSentinel"
+title: "Docker Production Deployment Guide for GeoSentinel"
 sidebarTitle: "Docker Production"
-description: "Deploy GeoSentinel to production with docker-compose.prod.yml: four services (backend, frontend/nginx, military-relay, ais-relay) behind Nginx Proxy Manager with SSL."
+description: "Run GeoSentinel in production with four Docker containers — backend, frontend, military relay, and AIS relay — behind Nginx Proxy Manager."
 ---
 
 The production deployment packages every GeoSentinel service into a dedicated Docker container coordinated by `docker-compose.prod.yml`. Unlike the local development setup — which runs PostgreSQL in Docker and everything else directly on the host — production runs all four application services as containers on a shared internal network (`geosentinel_net`) and connects them to a pre-existing PostgreSQL instance on the external `database_network`. Inbound HTTPS traffic is handled by Nginx Proxy Manager, which terminates SSL and forwards requests to the frontend container. The frontend's bundled Nginx configuration then reverse-proxies `/v1/` API calls to the backend container internally.
@@ -139,7 +139,7 @@ Create a **Proxy Host** entry in NPM pointing to the frontend container. Because
 The frontend Docker image copies `docker/nginx/geosentinel.conf` into the Nginx container at `/etc/nginx/conf.d/default.conf`. This configuration handles all reverse-proxying internally, so **no Custom Locations are needed in NPM**:
 
 | Location | Proxied To | Purpose |
-|----------|-----------|---------|
+|----------|-----------|---------| 
 | `/v1/` | `http://backend:8000` | All REST API calls (incidents, AOI, health, seed, military-flights) |
 | `/docs` | `http://backend:8000` | Swagger UI |
 | `/openapi.json` | `http://backend:8000` | OpenAPI schema for Swagger |

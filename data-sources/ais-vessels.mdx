@@ -1,5 +1,5 @@
 ---
-title: "AIS Vessel Tracking via AISStream Relay"
+title: "AIS Vessel Tracking via AISStream WebSocket Relay Service"
 sidebarTitle: "AIS Vessels"
 description: "How GeoSentinel's ais-relay microservice streams real-time vessel positions from AISStream WebSocket and serves them per active AOI bounding box."
 ---
@@ -24,7 +24,7 @@ AISStream aggregates global AIS data from a network of terrestrial and satellite
 
 ## Architecture
 
-```
+```text
 AISStream WebSocket (wss://stream.aisstream.io/v0/stream)
        ↓  AISSTREAM_API_KEY
  ais-relay (FastAPI, port 8003)
@@ -119,7 +119,7 @@ Dark-ship detection runs on a background schedule. The `DARK_SHIP_THRESHOLD_MIN`
 
 The relay's vessel list endpoint filters the `VesselStore` by geographic bounding box:
 
-```
+```text
 GET /api/ais/v1/list-vessels?neLat={ne_lat}&neLon={ne_lon}&swLat={sw_lat}&swLon={sw_lon}
 ```
 
@@ -134,7 +134,7 @@ if sw_lat <= v.location.latitude <= ne_lat and sw_lon <= v.location.longitude <=
 
 The main backend exposes AIS data through:
 
-```
+```text
 GET /v1/ais-vessels
 ```
 

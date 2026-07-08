@@ -1,7 +1,7 @@
 ---
-title: "USGS Earthquake Feed Ingestion"
+title: "USGS Earthquake Feed: Ingestion and Severity Mapping"
 sidebarTitle: "USGS"
-description: "How GeoSentinel ingests USGS GeoJSON earthquake data: 3-minute polling, magnitude 4.0+ filter, Richter severity mapping, and properties.ids deduplication."
+description: "How GeoSentinel polls the USGS FDSN API: 3-minute interval, magnitude 4.0+ filter, moment-magnitude severity, and properties.ids deduplication."
 ---
 
 GeoSentinel polls the **USGS FDSN Event API** every three minutes to ingest significant seismic events worldwide. The US Geological Survey publishes a near-real-time GeoJSON feed of earthquake detections from its global seismograph network — the most reliable public source for rapid earthquake notification. GeoSentinel applies a minimum magnitude filter of 4.0 to eliminate microseismicity and focus on events likely to cause structural impact or human casualties. No API key is required; the USGS feed is a fully public, domain-licensed government resource.
@@ -32,7 +32,7 @@ The USGS FDSN (Federation of Digital Seismograph Networks) web service delivers 
 
 The full URL built by `_build_url()` looks like:
 
-```
+```text
 https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson
   &starttime=2025-07-15T10:00:00
   &endtime=2025-07-15T10:05:00
@@ -60,20 +60,20 @@ Unknown type values default to `event_type = "earthquake"` but are assigned `cat
 
 ## Severity Mapping
 
-Severity (0–10) is derived from the **Richter magnitude** using a stepped table. The mapper applies `math.ceil()` to the raw magnitude before table lookup — a magnitude 5.8 event is treated as magnitude 6 for severity purposes, reflecting a conservative upward rounding:
+Severity (0–10) is derived from the **moment magnitude** using a stepped table. The mapper applies `math.ceil()` to the raw magnitude before table lookup — a magnitude 5.8 event is treated as magnitude 6 for severity purposes, reflecting a conservative upward rounding:
 
 ```python
 severity = _normalize_severity(math.ceil(magnitude)) if magnitude else _normalize_severity(0)
 ```
 
-| Richter magnitude (ceiled) | Severity |
+| Moment magnitude (ceiled) | Severity |
 |---|---|
-| 0.0–3.9 | 1.0 |
-| 4.0–4.9 | 2.0 |
-| 5.0–5.9 | 4.0 |
-| 6.0–6.9 | 6.0 |
-| 7.0–7.9 | 8.0 |
-| ≥ 8.0 | 10.0 |
+| ≤ 3.0 (ceiled: 1–3) | 1.0 |
+| 3.1–4.0 (ceiled: 4) | 2.0 |
+| 4.1–5.0 (ceiled: 5) | 4.0 |
+| 5.1–6.0 (ceiled: 6) | 6.0 |
+| 6.1–7.0 (ceiled: 7) | 8.0 |
+| > 7.0 (ceiled: ≥ 8) | 10.0 |
 
 A magnitude 7.2 earthquake (ceiled to 8) yields severity 10.0. A magnitude 4.1 event (ceiled to 5) yields severity 4.0.
 

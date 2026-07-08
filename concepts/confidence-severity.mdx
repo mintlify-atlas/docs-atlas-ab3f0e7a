@@ -1,7 +1,7 @@
 ---
-title: "Confidence and Severity Scoring in GeoSentinel"
+title: "Confidence and Severity Scoring: GeoSentinel Reference"
 sidebarTitle: "Confidence & Severity"
-description: "How GeoSentinel calculates incident confidence from source independence classes and severity from raw source metrics like Richter magnitude and fire radiative power."
+description: "How GeoSentinel calculates confidence from source independence classes and severity from raw metrics like seismic magnitude and fire radiative power."
 ---
 
 Every event in GeoSentinel carries two normalized numeric scores: `severity` and `confidence`. Both are `FLOAT` values constrained to the range `[0.0, 10.0]` by `CHECK` constraints on both `events_canonical` and `incidents`. Severity measures the real-world impact of the event, derived from source-native physical or humanitarian metrics. Confidence measures how much trust to place in the observation, derived from the independence class of the contributing sources and — for media-derived sources — how many reports likely share the same origin article. These two scores enable API consumers to filter and prioritize incidents without understanding the specifics of each underlying data source.
@@ -12,9 +12,9 @@ Every event in GeoSentinel carries two normalized numeric scores: `severity` and
 
 Severity is calculated by each source mapper by translating a raw physical or humanitarian metric into the `[0.0, 10.0]` scale. The goal, as defined in the data model spec, is to enable meaningful comparison of severity across event categories — a severity 7.0 earthquake and a severity 7.0 conflict should represent roughly equivalent levels of impact.
 
-### Conflict (ACLED, GDELT)
+### Conflict (ACLED)
 
-Conflict severity is derived from reported fatalities (ACLED) or from the GDELT Goldstein scale. The fatality-to-severity mapping:
+ACLED conflict severity is derived from the reported fatality count:
 
 | Fatalities | Severity |
 |---|---|
@@ -25,19 +25,33 @@ Conflict severity is derived from reported fatalities (ACLED) or from the GDELT 
 | 101 – 500 | 8.5 |
 | > 500 | 10.0 |
 
+### Conflict (GDELT)
+
+GDELT conflict severity is derived from the Goldstein scale, a numeric measure of the theoretical impact of an event on a country's stability (range approximately −10 to +10, where more negative = more destabilizing):
+
+| Goldstein Scale | Severity |
+|---|---|
+| < −8.0 | 10.0 |
+| −8.0 to −6.0 | 8.5 |
+| −6.0 to −4.0 | 6.5 |
+| −4.0 to −2.0 | 4.5 |
+| −2.0 to 0.0 | 2.5 |
+| ≥ 0.0 | 1.0 |
+
 ### Earthquake (USGS)
 
-Earthquake severity maps directly from Richter scale magnitude:
+Earthquake severity is mapped from the reported magnitude. The mapper rounds the raw magnitude up to the next integer boundary before lookup, so a magnitude 5.8 is evaluated as 6.0:
 
-| Richter Magnitude | Severity |
+| Magnitude (ceiling-rounded) | Severity |
 |---|---|
 | < 4.0 | 1.0 |
-| 4.0 – 5.0 | 3.5 |
-| 5.0 – 6.0 | 5.5 |
-| 6.0 – 7.0 | 7.5 |
-| > 7.0 | 10.0 |
+| 4.0 – 4.9 | 2.0 |
+| 5.0 – 5.9 | 4.0 |
+| 6.0 – 6.9 | 6.0 |
+| 7.0 – 7.9 | 8.0 |
+| ≥ 8.0 | 10.0 |
 
-A magnitude 6.8 earthquake — capable of causing widespread structural damage — maps to severity 7.5. A minor magnitude 3.5 tremor (typically not felt) maps to 1.0.
+A magnitude 6.8 earthquake rounds up to 7.0, mapping to severity 8.0. A minor magnitude 3.5 tremor rounds up to 4.0, mapping to severity 2.0.
 
 ### Wildfire / Thermal Anomaly (FIRMS)
 
@@ -45,12 +59,13 @@ FIRMS provides Fire Radiative Power (FRP) in megawatts, a direct measurement of 
 
 | FRP (MW) | Severity |
 |---|---|
-| < 50 MW | 2.0 |
-| 50 – 200 MW | 4.0 |
-| 200 – 1,000 MW | 6.5 |
-| > 1,000 MW | 9.0 |
+| 0 – 4 MW | 1.0 |
+| 4 – 8 MW | 2.5 |
+| 8 – 25 MW | 5.0 |
+| 25 – 50 MW | 7.5 |
+| ≥ 50 MW | 10.0 |
 
-A low-intensity grass fire under 50 MW maps to 2.0. A major crown fire above 1,000 MW — comparable to some of the largest recorded wildfires — maps to 9.0.
+A low-intensity detection under 4 MW maps to 1.0. A large, high-intensity fire at or above 50 MW maps to the maximum severity of 10.0.
 
 ### At the Incident Level
 

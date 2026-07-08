@@ -1,7 +1,7 @@
 ---
 title: "Data Sources: How GeoSentinel Ingests Global Events"
 sidebarTitle: "Overview"
-description: "GeoSentinel pulls from six open-data sources — GDELT, ACLED, FIRMS, USGS, OpenSky, and AISStream — each polled on independent schedules with automatic retry."
+description: "GeoSentinel aggregates six open-data sources — GDELT, ACLED, FIRMS, USGS, OpenSky, and AISStream — each polled independently with automatic retry."
 ---
 
 GeoSentinel aggregates geospatial incident data from six distinct open-data sources, each operating on its own independent polling cycle with exponential backoff and automatic retry logic. Every event passes through a shared normalization pipeline — mapped to the internal `EventCanonicalCreate` schema — then validated, deduplicated by `(source, event_id_source)`, and written to `events_canonical` before being clustered into incidents. The sources are deliberately heterogeneous: media-derived conflict reports, field-verified conflict data, satellite fire detections, seismic sensor feeds, ADS-B military aircraft positions, and real-time AIS vessel telemetry. This diversity is intentional — no single source dominates the confidence calculation.
